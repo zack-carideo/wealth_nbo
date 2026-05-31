@@ -1,0 +1,147 @@
+<h2 class="sr-only">Next best offer framework showing MVP versus optimal staged approach</h2>
+<style>
+  .phase-btn { padding:6px 16px; border-radius:20px; border:1px solid var(--color-border-secondary); background:var(--color-background-secondary); color:var(--color-text-secondary); font-size:13px; font-family:var(--font-sans); cursor:pointer; transition:all .2s; font-weight:400; }
+  .phase-btn.active { background:#085041; color:#E1F5EE; border-color:#085041; font-weight:500; }
+  @media(prefers-color-scheme:dark){ .phase-btn.active { background:#5DCAA5; color:#04342C; border-color:#5DCAA5; } }
+  .opt { transition: opacity .35s ease, transform .35s ease; }
+  .opt.hidden { opacity:0; transform:translateY(-6px); pointer-events:none; position:absolute; }
+  .legend-dot { display:inline-block; width:10px; height:10px; border-radius:3px; margin-right:4px; vertical-align:middle; }
+</style>
+<div style="display:flex;gap:8px;align-items:center;margin-bottom:12px">
+  <button class="phase-btn active" id="btn-mvp" onclick="setPhase('mvp')">MVP</button>
+  <button class="phase-btn" id="btn-opt" onclick="setPhase('optimal')">Optimal</button>
+  <span style="margin-left:auto;font-size:12px;color:var(--color-text-tertiary)">
+    <span class="legend-dot" style="background:#0F6E56"></span>MVP
+    <span class="legend-dot" style="background:#534AB7;margin-left:8px"></span>Optimal additions
+  </span>
+</div>
+<div style="position:relative">
+<svg id="diagram" width="100%" viewBox="0 0 680 700">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker>
+  </defs>
+
+  <!-- DATA SOURCE -->
+  <g class="c-gray">
+    <rect x="40" y="20" width="600" height="44" rx="10" stroke-width="0.5"/>
+    <text class="th" x="340" y="42" text-anchor="middle" dominant-baseline="central">Client data</text>
+  </g>
+
+  <!-- Arrows to signal layer -->
+  <line x1="170" y1="64" x2="170" y2="110" class="arr" marker-end="url(#arrow)"/>
+  <line x1="480" y1="64" x2="480" y2="110" class="arr" marker-end="url(#arrow)"/>
+  <line class="arr opt" id="a-timing" x1="340" y1="64" x2="340" y2="110" marker-end="url(#arrow)"/>
+  <line class="arr opt" id="a-value" x1="580" y1="64" x2="580" y2="110" marker-end="url(#arrow)"/>
+
+  <!-- STAGE LABEL: MVP -->
+  <text class="ts" x="46" y="100" fill="#0F6E56">MVP</text>
+
+  <!-- SIGNAL LAYER -->
+  <!-- MVP: Propensity -->
+  <g class="node c-teal" onclick="sendPrompt('Build the propensity model code for the NBO MVP')">
+    <rect x="60" y="110" width="220" height="56" rx="8" stroke-width="0.5"/>
+    <text class="th" x="170" y="130" text-anchor="middle" dominant-baseline="central">Propensity model</text>
+    <text class="ts" x="170" y="148" text-anchor="middle" dominant-baseline="central">P(adopt product X)</text>
+  </g>
+
+  <!-- MVP: Markov -->
+  <g class="node c-teal" onclick="sendPrompt('Build the Markov transition matrix code for the NBO MVP')">
+    <rect x="370" y="110" width="220" height="56" rx="8" stroke-width="0.5"/>
+    <text class="th" x="480" y="130" text-anchor="middle" dominant-baseline="central">Markov transitions</text>
+    <text class="ts" x="480" y="148" text-anchor="middle" dominant-baseline="central">P(next | last purchased)</text>
+  </g>
+
+  <!-- OPTIMAL: Timing -->
+  <g class="node c-purple opt" id="box-timing">
+    <rect x="230" y="110" width="170" height="56" rx="8" stroke-width="0.5"/>
+    <text class="th" x="315" y="130" text-anchor="middle" dominant-baseline="central">Timing model</text>
+    <text class="ts" x="315" y="148" text-anchor="middle" dominant-baseline="central">Survival / hazard</text>
+  </g>
+
+  <!-- OPTIMAL: Value -->
+  <g class="node c-purple opt" id="box-value">
+    <rect x="540" y="110" width="100" height="56" rx="8" stroke-width="0.5"/>
+    <text class="th" x="590" y="130" text-anchor="middle" dominant-baseline="central">Value</text>
+    <text class="ts" x="590" y="148" text-anchor="middle" dominant-baseline="central">E[revenue]</text>
+  </g>
+
+  <!-- Arrows to scoring -->
+  <line x1="170" y1="166" x2="170" y2="220" class="arr" marker-end="url(#arrow)"/>
+  <line x1="480" y1="166" x2="480" y2="220" class="arr" marker-end="url(#arrow)"/>
+  <line class="arr opt" id="a-timing2" x1="315" y1="166" x2="315" y2="220" marker-end="url(#arrow)"/>
+  <line class="arr opt" id="a-value2" x1="590" y1="166" x2="590" y2="220" marker-end="url(#arrow)"/>
+
+  <!-- MVP SCORING -->
+  <g class="c-teal" id="score-mvp">
+    <rect x="60" y="220" width="580" height="56" rx="10" stroke-width="0.5"/>
+    <text class="th" x="350" y="240" text-anchor="middle" dominant-baseline="central">MVP scoring</text>
+    <text class="ts" x="350" y="258" text-anchor="middle" dominant-baseline="central">score = propensity x transition probability</text>
+  </g>
+
+  <!-- OPTIMAL SCORING (overlays MVP) -->
+  <g class="c-purple opt" id="score-opt">
+    <rect x="60" y="220" width="580" height="56" rx="10" stroke-width="0.5"/>
+    <text class="th" x="350" y="240" text-anchor="middle" dominant-baseline="central">Optimization layer</text>
+    <text class="ts" x="350" y="258" text-anchor="middle" dominant-baseline="central">score = f(propensity, sequence, timing, value, channel)</text>
+  </g>
+
+  <!-- Arrow to output -->
+  <line x1="350" y1="276" x2="350" y2="320" class="arr" marker-end="url(#arrow)"/>
+
+  <!-- OUTPUT -->
+  <g class="c-gray">
+    <rect x="100" y="320" width="480" height="44" rx="8" stroke-width="0.5"/>
+    <text class="th" x="340" y="342" text-anchor="middle" dominant-baseline="central">Ranked next-best-offer per client</text>
+  </g>
+
+  <!-- DETAIL PANELS -->
+  <!-- MVP detail -->
+  <g class="c-teal" id="detail-mvp">
+    <rect x="40" y="410" width="290" height="264" rx="10" stroke-width="0.5"/>
+    <text class="th" x="185" y="434" text-anchor="middle" dominant-baseline="central">MVP requirements</text>
+    <text class="ts" x="56" y="462" dominant-baseline="central">Propensity model (logistic / GBM)</text>
+    <text class="ts" x="56" y="484" dominant-baseline="central">First-order Markov transition matrix</text>
+    <text class="ts" x="56" y="506" dominant-baseline="central">Multiplicative composite score</text>
+    <text class="ts" x="56" y="528" dominant-baseline="central">Random stratified train/test split</text>
+    <text class="ts" x="56" y="550" dominant-baseline="central">AUC + decile lift evaluation</text>
+    <text class="ts" x="56" y="572" dominant-baseline="central">Static scored file output (CSV)</text>
+    <text class="ts" x="56" y="600" dominant-baseline="central">Single target product per run</text>
+    <text class="ts" x="56" y="628" dominant-baseline="central">Basic class imbalance handling</text>
+    <text class="ts" x="56" y="656" dominant-baseline="central">Coefficient / feature importance review</text>
+  </g>
+
+  <!-- Optimal detail -->
+  <g class="c-purple opt" id="detail-opt">
+    <rect x="350" y="410" width="290" height="264" rx="10" stroke-width="0.5"/>
+    <text class="th" x="495" y="434" text-anchor="middle" dominant-baseline="central">Optimal additions</text>
+    <text class="ts" x="366" y="462" dominant-baseline="central">Survival / hazard timing model</text>
+    <text class="ts" x="366" y="484" dominant-baseline="central">Expected value regression layer</text>
+    <text class="ts" x="366" y="506" dominant-baseline="central">Channel conditioning per signal</text>
+    <text class="ts" x="366" y="528" dominant-baseline="central">Higher-order / embedding sequences</text>
+    <text class="ts" x="366" y="550" dominant-baseline="central">Temporal out-of-time validation</text>
+    <text class="ts" x="366" y="572" dominant-baseline="central">Multi-product scoring loop</text>
+    <text class="ts" x="366" y="600" dominant-baseline="central">Fairness audit + SR 11-7 docs</text>
+    <text class="ts" x="366" y="628" dominant-baseline="central">PSI / score decay monitoring</text>
+    <text class="ts" x="366" y="656" dominant-baseline="central">Campaign system integration</text>
+  </g>
+</svg>
+</div>
+<script>
+const optEls = document.querySelectorAll('.opt');
+function setPhase(phase) {
+  const showOpt = phase === 'optimal';
+  document.getElementById('btn-mvp').classList.toggle('active', phase === 'mvp');
+  document.getElementById('btn-opt').classList.toggle('active', showOpt);
+  optEls.forEach(el => {
+    if (el.tagName === 'line') {
+      el.style.opacity = showOpt ? '1' : '0';
+    } else {
+      el.classList.toggle('hidden', !showOpt);
+    }
+  });
+  document.getElementById('score-mvp').style.display = showOpt ? 'none' : '';
+  const h = showOpt ? 700 : 700;
+  document.getElementById('diagram').setAttribute('viewBox', '0 0 680 ' + h);
+}
+setPhase('mvp');
+</script>

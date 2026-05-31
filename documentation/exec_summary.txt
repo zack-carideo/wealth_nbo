@@ -1,0 +1,29 @@
+Executive summary
+FCB's revenue growth depends on putting the right product in front of the right customer at the right time, and single-signal targeting leaves measurable lift on the table by ignoring journey context, timing, and economic value. The NBO framework combines four orthogonal signals — adoption likelihood, sequence position, timing, and expected value — into a unified composite score for every customer-product pair. The result is a single ranked recommendation per customer that is both likely to convert and commercially worth converting.
+Propensity
+
+Answers "how likely is each customer to adopt each product?"
+Uses structured features: product ownership, balances, channel mix, behavioral aggregates
+Produces a per-customer-per-product likelihood score
+Filters out products the customer is structurally unlikely to take
+
+Sequence
+
+Answers "what is the natural next product in this customer's journey?"
+Models historical patterns of product progression across the customer base
+Captures journey logic that propensity-alone scoring misses
+Surfaces sequentially relevant products even when their standalone propensity is moderate
+
+Timing
+
+Answers "when is each customer likely to act, not just whether?"
+Uses survival/hazard methods on inter-purchase intervals
+Converts static targeting into time-aware recommendation windows
+Prevents wasted campaign spend on customers in dormant periods
+
+Value
+
+Answers "what is each product worth if this customer adopts it?"
+Combines product margin with expected balance trajectory and tenure
+Tilts the composite score toward commercially meaningful adoptions
+Prevents over-recommending low-value products simply because they convert easily

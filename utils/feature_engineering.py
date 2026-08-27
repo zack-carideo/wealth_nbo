@@ -70,12 +70,33 @@ from after the thing being predicted.
 
 Optional: terminal-event hazard
 -------------------------------
-One label-aware extra, off unless `terminal_event_states` is set. It suits a
-specific and common setup: an outcome that happens at most once and closes the
-observation window, with history truncated at it. See `_hazard_layer` and
-`_fit_hazard` for what it computes and the two leakage guards it enforces.
-Everything above works without it, and the module has no other notion of a
-label.
+One label-aware extra, off unless the outcome is declared. It suits a specific
+and common setup: an outcome that happens at most once and closes the
+observation window, with history truncated at it.
+
+Declare the outcome rows either way round:
+
+  terminal_flag_col     a column that is set only on outcome rows. This is the
+                        usual shape when outcomes arrive from a separate
+                        table: the row carries an id, a date and a flag, and
+                        every other column is null because its only job is to
+                        say WHEN the outcome happened, not to describe it.
+  terminal_event_states values within `event_col` that mark the outcome, for
+                        logs where the outcome is one state among many.
+
+Declaring them is what strips those rows out of every feature layer. An
+undeclared outcome row is counted as an ordinary event, which hands the label
+straight to `n_events`, `recency` and the windowed counts -- so a declaration
+that matches nothing is an error here, never a silent no-op.
+
+Marker rows being otherwise null is harmless: they are removed before roles
+are inferred or any aggregate is computed, and the hazard reads only their
+position in time. `event_col` is optional alongside a flag -- without one
+there is no context to condition on, so only the run-length hazard is
+produced. See `_hazard_layer` and `_fit_hazard` for the rest.
+
+Everything above works without any of this, and the module has no other notion
+of a label.
 
 Scale
 -----
@@ -107,6 +128,11 @@ __all__ = [
 
 Context = Tuple[Any, ...]
 Counts = Tuple[int, int]  # (n_at_risk, n_events)
+
+_STATE = "__state__"       # internal per-row state used by the hazard layer
+_OBSERVED = "__observed__"  # internal state for a row whose own event type is unknown
+_TERMINAL = "__terminal__"  # internal state standing for an outcome row
+_INTERNAL = ("__t__", "__cutoff__", _STATE)
 
 _SECONDS_PER_DAY = 86_400.0
 
@@ -142,8 +168,12 @@ class FeatureEngineeringConfig:
 
     category_universe: Optional[Dict[str, List[Any]]] = None  # persist and reuse when scoring
 
-    # -- optional terminal-event hazard; inert unless terminal_event_states is set
+    # -- optional terminal-event hazard; inert unless the outcome is declared
     event_col: Optional[str] = None
+    # Outcome rows, declared either as a flag column that is set only on them
+    # (the usual shape when outcomes come from a separate table) or as values
+    # within event_col. Either one strips those rows from every feature layer.
+    terminal_flag_col: Optional[str] = None
     terminal_event_states: Sequence[Any] = field(default_factory=tuple)
     context_orders: Sequence[int] = (1, 2)
     hazard_min_support: int = 25
@@ -568,6 +598,23 @@ class HazardModel:
                 .reset_index(drop=True))
 
 
+def _terminal_mask(work: pd.DataFrame, cfg: FeatureEngineeringConfig) -> pd.Series:
+    """Rows that mark the outcome, from a flag column or from event_col values.
+
+    A flag counts as set when it is non-null and not zero, so 1/True/"Y" all
+    work and an all-null column on non-outcome rows is simply absent.
+    """
+    mask = pd.Series(False, index=work.index)
+    if cfg.terminal_flag_col:
+        if cfg.terminal_flag_col not in work.columns:
+            raise KeyError(f"terminal_flag_col '{cfg.terminal_flag_col}' not found in input dataframe")
+        flag = work[cfg.terminal_flag_col]
+        mask |= flag.notna() & (flag != 0)
+    if cfg.terminal_event_states and cfg.event_col:
+        mask |= work[cfg.event_col].isin(set(cfg.terminal_event_states))
+    return mask
+
+
 def _sequences(df: pd.DataFrame, id_col: str, value_col: str) -> Dict[Hashable, List[Any]]:
     """Each entity's states, oldest first, nulls dropped. Rows must be sorted."""
     valid = df.loc[df[value_col].notna(), [id_col, value_col]]
@@ -664,21 +711,32 @@ def _hazard_layer(
     population hazard. `work` has them stripped and is the only frame any
     per-entity feature is read from.
     """
-    id_col, event_col = cfg.id_col, cfg.event_col
-    terminal = set(cfg.terminal_event_states)
+    id_col = cfg.id_col
+    terminal = {_TERMINAL}
     orders = sorted({int(k) for k in cfg.context_orders if int(k) >= 1}, reverse=True)
+
+    # With one distinct non-outcome state there is nothing to condition on, so
+    # every context feature would be the same number for every entity. Emit the
+    # run-length hazard alone rather than three constant columns.
+    has_context = int(work[_STATE].nunique(dropna=True)) >= 2
+    if not has_context:
+        warnings.warn(
+            "no event_col, or only one distinct state, so there is no context to condition on -- "
+            "emitting hazard_runlen only. Set event_col to a behavioural state column to get the "
+            "context hazard as well."
+        )
 
     hazard = prefit
     if hazard is None:
         fit_seqs = _sequences(fit_df.sort_values([id_col, "__t__"], kind="mergesort"),
-                              id_col, event_col)
+                              id_col, _STATE)
         if not fit_seqs:
             warnings.warn("no usable history; hazard features skipped")
             return pd.DataFrame(index=index), None
         hazard = _fit_hazard(fit_seqs, terminal, orders, cfg.runlen_cap)
 
     rows: List[Dict[str, Any]] = []
-    for id_, states in _sequences(work, id_col, event_col).items():
+    for id_, states in _sequences(work, id_col, _STATE).items():
         n_obs = len(states)
         base_rate = _loo_rate(hazard.base, hazard.own_base.get(id_, (0, 0)), 1)
         if base_rate is None:
@@ -706,13 +764,12 @@ def _hazard_layer(
         if context_rate is None:
             context_rate = base_rate
 
-        rows.append({
-            id_col: id_,
-            "hazard_runlen": base_rate if by_runlen is None else by_runlen,
-            "hazard_context": context_rate,
-            "hazard_context_order": context_order,  # 0 = fell back to the base rate
-            "hazard_lift": context_rate / base_rate if base_rate else np.nan,
-        })
+        row = {id_col: id_, "hazard_runlen": base_rate if by_runlen is None else by_runlen}
+        if has_context:
+            row["hazard_context"] = context_rate
+            row["hazard_context_order"] = context_order  # 0 = fell back to the base rate
+            row["hazard_lift"] = context_rate / base_rate if base_rate else np.nan
+        rows.append(row)
 
     if not rows:
         return pd.DataFrame(index=index), hazard
@@ -793,10 +850,13 @@ def build_feature_table(
     if work.empty:
         raise ValueError("no rows with a usable timestamp")
 
-    terminal = set(config.terminal_event_states)
-    if terminal and config.event_col is None:
-        raise ValueError("terminal_event_states requires event_col to be set")
-    if terminal and as_of is None:
+    declares_outcome = bool(config.terminal_event_states) or bool(config.terminal_flag_col)
+    if config.terminal_event_states and config.event_col is None:
+        raise ValueError(
+            "terminal_event_states names values inside event_col, which is not set. Use "
+            "terminal_flag_col instead when the outcome is marked by its own flag column."
+        )
+    if declares_outcome and as_of is None:
         raise ValueError(
             "as_of is required when terminal_event_states is configured: without it the cutoff "
             "falls after the event for positives and so encodes the label. Pass the per-entity "
@@ -812,15 +872,44 @@ def build_feature_table(
     # The hazard is a population object and has to see outcomes, so it is fit
     # from the pre-strip frame; every feature is read from the stripped one.
     fit_df = work
-    if terminal:
+    if declares_outcome:
+        is_terminal = _terminal_mask(work, config)
+        if not is_terminal.any():
+            raise ValueError(
+                "the outcome declaration matched no rows at/before the cutoff. Left unfixed this "
+                "would count outcome rows as ordinary events and hand the label to n_events and "
+                "recency, so it is an error rather than a no-op. Check that terminal_flag_col is "
+                "the column set on outcome rows, or that terminal_event_states holds values that "
+                f"actually appear in {config.event_col!r}."
+            )
+
+        # The window is supposed to END at the outcome; anything after one means
+        # either the cutoff is past it or the outcome is not really once-only.
+        after = is_terminal.groupby(work[id_col]).cumsum() - is_terminal.astype(int)
+        if int((after > 0).sum()):
+            warnings.warn(
+                f"{int((after > 0).sum())} row(s) fall after an outcome row inside the same "
+                "entity's window. The window should end at the outcome, so this means the cutoff "
+                "is past it or the outcome repeats -- either way the label is ambiguous."
+            )
+
+        # One state per row for the hazard: the entity's behaviour where known,
+        # a placeholder where not, and the terminal marker on outcome rows.
+        if config.event_col is None:
+            state = pd.Series(_OBSERVED, index=work.index, dtype=object)
+        else:
+            state = work[config.event_col].astype(object).fillna(_OBSERVED)
+        work[_STATE] = state.where(~is_terminal, _TERMINAL)
+
+        fit_df = work
         before = work[id_col].nunique()
-        work = work[~work[config.event_col].isin(terminal)]
+        work = work[~is_terminal]
         if work.empty:
-            raise ValueError("every row at/before the cutoff is a terminal event")
+            raise ValueError("every row at/before the cutoff is an outcome row")
         lost = before - work[id_col].nunique()
         if lost:
             warnings.warn(
-                f"{lost} entity/entities had no history other than the terminal event and are "
+                f"{lost} entity/entities had no history other than the outcome row and are "
                 "absent from the table. They are not scoreable, but dropping them changes the "
                 "population -- handle them explicitly rather than letting them vanish."
             )
@@ -830,7 +919,7 @@ def build_feature_table(
 
     if column_roles is None:
         column_roles = infer_column_roles(
-            work.drop(columns=["__t__", "__cutoff__"]), id_col, time_col,
+            work.drop(columns=[c for c in _INTERNAL if c in work.columns]), id_col, time_col,
             max_categories=config.max_categories, level_autocorr=config.level_autocorr,
             sample_rows=config.infer_sample_rows, ignore_cols=config.ignore_cols,
         )
@@ -844,6 +933,9 @@ def build_feature_table(
     for role in ("flow", "level", "categorical", "static"):
         roles[role] = [c for c in roles.get(role, []) if c not in set(config.ignore_cols)]
     roles.setdefault("skipped", [])
+    if config.terminal_flag_col:  # describes the outcome, never the entity
+        for role in ("flow", "level", "categorical", "static"):
+            roles[role] = [c for c in roles[role] if c != config.terminal_flag_col]
 
     windows = _window_masks(work, "__cutoff__", "__t__", config.recent_windows)
     universe: Dict[str, List[Any]] = {k: list(v) for k, v in (config.category_universe or {}).items()}
@@ -855,7 +947,7 @@ def build_feature_table(
     layers["categorical"] = _categorical_layer(work, config, roles["categorical"], universe, index)
     layers["static"] = _static_layer(work, config, roles["static"], universe, index)
 
-    if terminal:
+    if declares_outcome:
         layers["hazard"], hazard = _hazard_layer(fit_df, work, config, index, hazard)
     else:
         hazard = None
@@ -944,11 +1036,16 @@ def _demo_datasets(seed: int = 0) -> Dict[str, Dict[str, Any]]:
             segment = "private" if balance > 30_000 else "retail"
             rows.append({"customer_id": cust_id, "txn_ts": stamp, "event": state,
                          "txn_amount": round(float(rng.uniform(10, 2_000)), 2),
-                         "balance": round(balance, 2), "segment": segment})
+                         "balance": round(balance, 2), "segment": segment,
+                         "outcome_flag": np.nan})
             stamp += pd.Timedelta(days=float(rng.uniform(1, 40)))
             if rng.random() < true_hazard[state]:
-                rows.append({"customer_id": cust_id, "txn_ts": stamp, "event": "purchase",
-                             "txn_amount": 0.0, "balance": round(balance, 2), "segment": segment})
+                # the outcome row as it actually arrives: an id, a date and a
+                # flag saying WHEN it happened. Every other column is null
+                # because the row does not describe the event, only marks it.
+                rows.append({"customer_id": cust_id, "txn_ts": stamp, "event": None,
+                             "txn_amount": np.nan, "balance": np.nan, "segment": None,
+                             "outcome_flag": 1})
                 label = 1
                 break
             state = str(rng.choice(states, p=transition[state]))
@@ -958,7 +1055,7 @@ def _demo_datasets(seed: int = 0) -> Dict[str, Dict[str, Any]]:
         "df": pd.DataFrame(rows),
         "cfg": FeatureEngineeringConfig(
             id_col="customer_id", time_col="txn_ts", event_col="event",
-            terminal_event_states=("purchase",), context_orders=(1, 2),
+            terminal_flag_col="outcome_flag", context_orders=(1, 2),
         ),
         "as_of": pd.Series(cutoffs),
         "labels": pd.Series(labels),

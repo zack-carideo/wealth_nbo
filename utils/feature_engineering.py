@@ -68,6 +68,14 @@ If the table will be joined to a historical outcome, pass a per-id `as_of`
 strictly before the outcome is observed, or the features will include rows
 from after the thing being predicted.
 
+The cutoffs also have to be DRAWN the same way for both classes. Cutting every
+positive at its outcome date and every negative at today is the obvious design
+and it leaks: recency is then measured to a recent date for one class and to a
+date years back for the other, which separates them without saying anything
+about who converts. `matched_cutoffs` builds cutoffs that do not have that
+property. Nothing downstream can detect the problem, because the contamination
+spreads thinly across every timing feature instead of concentrating in one.
+
 Optional: terminal-event hazard
 -------------------------------
 One label-aware extra, off unless the outcome is declared. It suits a specific
@@ -123,6 +131,7 @@ __all__ = [
     "FeatureEngineeringArtifacts",
     "HazardModel",
     "infer_column_roles",
+    "matched_cutoffs",
     "build_feature_table",
 ]
 
@@ -161,6 +170,14 @@ class FeatureEngineeringConfig:
     # Windows are in the time column's own units: days for datetimes, raw
     # units for a numeric time column. Empty disables windowed features.
     recent_windows: Sequence[float] = (30, 90)
+
+    # Columns where a literal 0 means "not applicable to this row" rather than a
+    # real zero -- common when one wide table carries several product types and
+    # each row only fills in the columns its own type uses. Named columns have
+    # their zeros converted to nulls before anything else runs, which keeps them
+    # out of means and out of the flow-vs-level test. Leave empty when zeros are
+    # genuine; see `zero_diagnostic` for deciding which case you are in.
+    zero_is_missing: Sequence[str] = field(default_factory=tuple)
 
     max_categories: int = 20  # one-hot width cap per column; the rest fold into __other__
     level_autocorr: float = 0.5  # within-entity lag-1 autocorrelation above which numeric = level
@@ -810,6 +827,130 @@ def _resolve_cutoff(work: pd.DataFrame, id_col: str, as_of: Any, unit: str) -> p
     return pd.Series(float(_to_axis([as_of], unit).iloc[0]), index=ids)
 
 
+def zero_diagnostic(
+    df: pd.DataFrame, numeric_col: str, by: str, top: int = 8,
+) -> pd.DataFrame:
+    """Is a zero in `numeric_col` a real zero, or "not applicable to this row"?
+
+    Breaks the zero rate down by another column -- normally the one naming the
+    row's type. Zeros concentrated in the types that do not use the column are
+    structural nulls; zeros spread evenly across every type are real
+    measurements. Mixed is mixed, and then the honest choice is to keep them and
+    let `{col}_zero_share` stand in for whatever the pattern means, rather than
+    guessing per row.
+    """
+    valid = df.loc[df[numeric_col].notna(), [numeric_col, by]]
+    if valid.empty:
+        return pd.DataFrame(columns=[by, "n_rows", "n_zero", "zero_rate", "nonzero_median"])
+    grouped = valid.groupby(by, dropna=False)[numeric_col]
+    out = pd.DataFrame({
+        "n_rows": grouped.size(),
+        "n_zero": grouped.apply(lambda x: int((x == 0).sum())),
+        "nonzero_median": grouped.apply(lambda x: x[x != 0].median()),
+    })
+    out["zero_rate"] = out["n_zero"] / out["n_rows"]
+    return (out.reset_index()[[by, "n_rows", "n_zero", "zero_rate", "nonzero_median"]]
+            .sort_values("zero_rate", ascending=False).head(top).reset_index(drop=True))
+
+
+def matched_cutoffs(
+    df: pd.DataFrame,
+    id_col: str,
+    time_col: str,
+    outcome_at: Union[pd.Series, Dict[Hashable, Any]],
+    strata: Optional[str] = None,
+    seed: int = 0,
+    upper_bound: Optional[Any] = None,
+) -> pd.Series:
+    """Per-entity `as_of` cutoffs whose DISTRIBUTION matches across classes.
+
+    The obvious sampling design -- cut every positive at its outcome date and
+    every negative at today -- makes the cutoff itself a function of the label.
+    Recency is then measured to a recent date for one class and to a date years
+    in the past for the other, so it separates the classes without carrying any
+    information about who converts. Measured on simulated data with this shape,
+    it handed `recency` 0.32 of spurious AUC and pushed five other timing
+    features off 0.5 as well. Nothing about it looks wrong in a per-feature
+    screen, because no single feature dominates.
+
+    This gives each negative a PSEUDO-outcome date instead: a waiting time
+    resampled from the positives, measured from the entity's own first row, so
+    negatives are observed at the same points in their life cycle as positives.
+    Positives keep their real outcome date.
+
+    Parameters
+    ----------
+    outcome_at : outcome timestamp per positive entity. Everything else in `df`
+        is treated as a negative.
+    strata : optional column to resample within (e.g. line of business), for
+        when waiting times differ by segment. Entities in a stratum with no
+        positives fall back to the pooled distribution.
+    upper_bound : cutoffs are clipped to this (default: the latest timestamp in
+        `df`), so no cutoff lands beyond the observable window.
+
+    Returns
+    -------
+    Series indexed by entity id, ready to pass as `build_feature_table(as_of=)`.
+    """
+    rng = np.random.default_rng(seed)
+    if isinstance(outcome_at, dict):
+        outcome_at = pd.Series(outcome_at)
+    outcome_at = pd.to_datetime(outcome_at)
+
+    stamps = pd.to_datetime(df[time_col])
+    first_seen = stamps.groupby(df[id_col]).min()
+    ids = first_seen.index
+    cap = pd.Timestamp(upper_bound) if upper_bound is not None else stamps.max()
+
+    positives = outcome_at.reindex(ids).dropna()
+    if positives.empty:
+        raise ValueError("outcome_at holds no entity present in df; nothing to resample from")
+
+    def offsets_for(pool: pd.Index) -> np.ndarray:
+        days = (positives.reindex(pool).dropna() - first_seen.reindex(pool)).dt.days
+        return days[days.notna() & (days >= 0)].to_numpy()
+
+    pooled = offsets_for(ids)
+    if pooled.size == 0:
+        raise ValueError("no positive has a non-negative waiting time; check outcome_at against df")
+
+    by_stratum: Dict[Any, np.ndarray] = {}
+    entity_stratum: Optional[pd.Series] = None
+    if strata is not None:
+        entity_stratum = df.groupby(id_col)[strata].first()
+        for value, group in entity_stratum.groupby(entity_stratum):
+            drawn = offsets_for(group.index)
+            if drawn.size >= 20:  # too few to resample from meaningfully
+                by_stratum[value] = drawn
+
+    negatives = ids.difference(positives.index)
+    draws = np.empty(len(negatives), dtype=float)
+    for i, entity in enumerate(negatives):
+        pool = pooled
+        if entity_stratum is not None:
+            pool = by_stratum.get(entity_stratum.get(entity), pooled)
+        draws[i] = rng.choice(pool)
+
+    cutoff = pd.concat([
+        positives,
+        pd.Series(first_seen.reindex(negatives) + pd.to_timedelta(draws, unit="D"),
+                  index=negatives),
+    ]).reindex(ids)
+
+    # never before the entity's own first row, never past the observable window
+    floor = first_seen + pd.Timedelta(days=1)
+    cutoff = cutoff.where(cutoff >= floor, floor).clip(upper=cap)
+    beyond = int((cutoff >= cap).sum())
+    if beyond:
+        warnings.warn(
+            f"{beyond} entity/entities drew a pseudo-cutoff at or past the end of the data and "
+            "were clipped to it. Their cutoffs are no longer matched -- consider excluding them, "
+            "or stratifying so the resampled waiting times suit their tenure."
+        )
+    cutoff.index.name = id_col
+    return cutoff
+
+
 def build_feature_table(
     df: pd.DataFrame,
     config: FeatureEngineeringConfig,
@@ -842,6 +983,14 @@ def build_feature_table(
     unit = _detect_time_unit(df[time_col])
     work = df.copy()
     work["__t__"] = _to_axis(work[time_col], unit)
+
+    for col in config.zero_is_missing:
+        if col not in work.columns:
+            raise KeyError(f"zero_is_missing names '{col}', which is not in the input dataframe")
+        if not pd.api.types.is_numeric_dtype(work[col]):
+            warnings.warn(f"zero_is_missing names '{col}', which is not numeric; ignoring it")
+            continue
+        work[col] = work[col].replace(0, np.nan)
 
     unusable = int(work["__t__"].isna().sum())
     if unusable:

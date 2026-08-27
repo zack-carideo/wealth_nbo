@@ -1,119 +1,75 @@
 """General-purpose feature engineering for transactional data.
 
-Turns any log of the form "one row per (entity, time, ...)" into one row per
-entity, suitable for variable selection and modeling. The only thing the
-input must have is an id column and something that orders events within an
-id. Every other column role is optional and, left unspecified, is inferred
-from the data.
+Turns any log shaped as one row per (entity, time, ...) into one row per
+entity. The only requirement is an id column and something that orders events
+within an id; every other column role is optional and inferred when not given.
 
     cfg = FeatureEngineeringConfig(id_col="customer_id", time_col="txn_ts")
     artifacts = build_feature_table(df, cfg)
 
-That is the whole required contract. Point it at card payments, clickstream,
-sensor readings, claims, or trade tickets and it will produce a sensible
-table without being told what the columns mean.
-
 Column roles
 ------------
-Roles are inferred by `infer_column_roles` unless you pass them explicitly:
+  static       constant within an entity (segment, region) -> last known value
+  flow         numeric and additive (amount, quantity)     -> sum, mean, max, last
+  level        numeric and persistent (balance, price)     -> last, min, max, change
+  categorical  low-cardinality labels (channel, product)   -> variety, concentration, current
 
-  static       constant within an entity (segment, region, account type) ->
-               carried through as the last known value.
-  flow         numeric and additive; each row is an independent quantity
-               (amount, quantity, duration) -> summed and averaged.
-  level        numeric and persistent; each row is a snapshot that carries
-               over (balance, price, temperature) -> last value and change.
-  categorical  low-cardinality labels (channel, merchant type, page, status)
-               -> distinct count, concentration, current value.
+Flow and level are told apart by how much a column carries over between an
+entity's own rows -- a balance is close to what it was last time, a payment
+amount is not. Inference is a starting point: it is reported in
+`artifacts.column_roles` and can be overridden per role in the config.
 
-Flow and level are separated by within-entity lag-1 autocorrelation, which is
-the property that actually distinguishes them: a balance is close to what it
-was last time, a payment amount is not. Inference is a starting point, not an
-oracle -- it is reported in `FeatureEngineeringArtifacts.column_roles`, and
-anything it gets wrong can be pinned in the config.
-
-Feature families
+Irregular timing
 ----------------
-Every family is deliberately small. On short histories -- and transactional
-data is dominated by entities with a handful of rows -- a wide aggregate
-family is mostly redundant: with three rows the mean and median inter-event
-gap are the same number, the standard deviation is a rescaled absolute
-difference, and a 90-day window contains the entire history. What is kept is
-the subset that stays distinct and defined when an entity has one or two rows.
+Transactional data is rarely on a cadence, and gaps between an entity's rows
+range from minutes to years within one table. Two consequences shape the
+design.
 
-  activity     n_events, tenure, recency, median/last gap, burstiness, rate,
-               and per-window event counts. Always produced.
-  flow         sum, mean, max, last, plus per-window sum and mean.
-  level        last, min, max, change since previous, change since first.
-  categorical  n_distinct, top-value share, current-value run length, and a
-               schema-stable one-hot of the current value.
-  static       last known value, one-hot encoded if not numeric.
+Fixed calendar windows do not survive it. A 30-day window over a log whose
+median gap is 500 days is empty for essentially every entity, and because a
+windowed sum fills to 0.0 the resulting columns look like data rather than
+absence. So windows over the last k EVENTS are the default: always defined,
+identical in meaning at any cadence. Calendar windows remain available via
+`recent_windows` and are worth turning on for dense logs, but they are off
+unless asked for.
+
+Timing features are reported both raw and relative to the entity's own rhythm.
+`recency` in days cannot be compared between an entity that transacts weekly
+and one that transacts every other year; `recency_ratio`, which divides it by
+that entity's median gap, can. Same for `gap_burstiness`.
 
 Time
 ----
 `time_col` may be datetime-like or numeric. Datetimes are measured in days; a
-numeric column (a sequence number, an epoch, a reading index) is used as-is
-and every window and duration is in those same units. The unit is recorded in
-`artifacts.time_unit`.
+numeric column (a sequence number, a reading index) is used as-is and every
+duration is in those units. The unit is recorded in `artifacts.time_unit`.
 
 Point-in-time correctness
 -------------------------
-Features come only from rows at or before an `as_of` cutoff. The default is a
-single cutoff for the whole population at the latest timestamp in the data --
-"score everyone as of now". Note that a PER-ENTITY cutoff of each entity's own
-last row, which looks like the natural default, silently forces recency to
-zero for everyone and so is not offered as one.
+Features come only from rows at or before an `as_of` cutoff, defaulting to one
+cutoff for the whole population at the latest timestamp present. A per-entity
+cutoff of each entity's own last row looks natural and is not offered, because
+it forces recency to zero for everyone.
 
-If the table will be joined to a historical outcome, pass a per-id `as_of`
-strictly before the outcome is observed, or the features will include rows
-from after the thing being predicted.
-
-The cutoffs also have to be DRAWN the same way for both classes. Cutting every
-positive at its outcome date and every negative at today is the obvious design
-and it leaks: recency is then measured to a recent date for one class and to a
-date years back for the other, which separates them without saying anything
-about who converts. `matched_cutoffs` builds cutoffs that do not have that
-property. Nothing downstream can detect the problem, because the contamination
-spreads thinly across every timing feature instead of concentrating in one.
+Cutoffs must also be DRAWN the same way for both classes. Cutting positives at
+their outcome date and negatives at today is the obvious design and it leaks:
+recency then runs to a recent date for one class and to a date years back for
+the other, separating them without saying anything about who converts. Use
+`matched_cutoffs`. Nothing downstream detects the problem, because it spreads
+thinly across every timing feature instead of concentrating in one.
 
 Optional: terminal-event hazard
 -------------------------------
-One label-aware extra, off unless the outcome is declared. It suits a specific
-and common setup: an outcome that happens at most once and closes the
-observation window, with history truncated at it.
+Off unless the outcome is declared, via `terminal_flag_col` (a column set only
+on outcome rows -- the usual shape when outcomes arrive from their own table
+carrying an id, a date and a flag) or `terminal_event_states` (values within
+`event_col`). Declaring them is what strips those rows from every layer; an
+undeclared outcome row is counted as an ordinary event and hands the label to
+`n_events` and `recency`, so a declaration matching nothing is an error rather
+than a silent no-op.
 
-Declare the outcome rows either way round:
-
-  terminal_flag_col     a column that is set only on outcome rows. This is the
-                        usual shape when outcomes arrive from a separate
-                        table: the row carries an id, a date and a flag, and
-                        every other column is null because its only job is to
-                        say WHEN the outcome happened, not to describe it.
-  terminal_event_states values within `event_col` that mark the outcome, for
-                        logs where the outcome is one state among many.
-
-Declaring them is what strips those rows out of every feature layer. An
-undeclared outcome row is counted as an ordinary event, which hands the label
-straight to `n_events`, `recency` and the windowed counts -- so a declaration
-that matches nothing is an error here, never a silent no-op.
-
-Marker rows being otherwise null is harmless: they are removed before roles
-are inferred or any aggregate is computed, and the hazard reads only their
-position in time. `event_col` is optional alongside a flag -- without one
-there is no context to condition on, so only the run-length hazard is
-produced. See `_hazard_layer` and `_fit_hazard` for the rest.
-
-Everything above works without any of this, and the module has no other notion
-of a label.
-
-Scale
------
-The core is vectorized -- groupby aggregations, no per-entity Python loops --
-so it is bounded by pandas rather than by row count. Only the optional hazard
-layer iterates per entity.
-
-Dependencies are numpy and pandas, and nothing else, including nothing else in
-this repository, so the file can be dropped into another project as-is.
+Dependencies are numpy and pandas, nothing else in this repository included, so
+the file is portable as-is. The core is vectorized; only the hazard iterates.
 """
 
 from __future__ import annotations
@@ -131,6 +87,7 @@ __all__ = [
     "FeatureEngineeringArtifacts",
     "HazardModel",
     "infer_column_roles",
+    "zero_diagnostic",
     "matched_cutoffs",
     "build_feature_table",
 ]
@@ -138,24 +95,17 @@ __all__ = [
 Context = Tuple[Any, ...]
 Counts = Tuple[int, int]  # (n_at_risk, n_events)
 
-_STATE = "__state__"       # internal per-row state used by the hazard layer
-_OBSERVED = "__observed__"  # internal state for a row whose own event type is unknown
-_TERMINAL = "__terminal__"  # internal state standing for an outcome row
-_INTERNAL = ("__t__", "__cutoff__", _STATE)
-
+_T, _CUT, _STATE = "__t__", "__cutoff__", "__state__"
+_INTERNAL = (_T, _CUT, _STATE)
+_TERMINAL, _OBSERVED = "__terminal__", "__observed__"
 _SECONDS_PER_DAY = 86_400.0
 
-
-# --------------------------------------------------------------------------
-# Configuration
-# --------------------------------------------------------------------------
 
 @dataclass
 class FeatureEngineeringConfig:
     """Column roles and knobs. Only `id_col` and `time_col` are required.
 
-    Any role left as None is inferred from the data; pass a list (including an
-    empty one) to pin it and skip inference for that role.
+    A role left as None is inferred; pass a list (even an empty one) to pin it.
     """
 
     id_col: str
@@ -167,44 +117,45 @@ class FeatureEngineeringConfig:
     static_cols: Optional[Sequence[str]] = None
     ignore_cols: Sequence[str] = field(default_factory=tuple)
 
-    # Windows are in the time column's own units: days for datetimes, raw
-    # units for a numeric time column. Empty disables windowed features.
-    recent_windows: Sequence[float] = (30, 90)
+    # Aggregate windows over the last k EVENTS -- defined at any cadence, which
+    # calendar windows are not. `recent_windows` adds calendar windows in the
+    # time column's units; leave it empty unless the log is dense enough that
+    # entities reliably have rows inside them.
+    recent_events: Sequence[int] = (3,)
+    recent_windows: Sequence[float] = ()
 
     # Columns where a literal 0 means "not applicable to this row" rather than a
-    # real zero -- common when one wide table carries several product types and
-    # each row only fills in the columns its own type uses. Named columns have
-    # their zeros converted to nulls before anything else runs, which keeps them
-    # out of means and out of the flow-vs-level test. Leave empty when zeros are
-    # genuine; see `zero_diagnostic` for deciding which case you are in.
+    # real zero -- common when one table carries several row types and each row
+    # fills in only the columns its type uses. Zeros become nulls before
+    # anything runs. Use `zero_diagnostic` to decide which columns need it.
     zero_is_missing: Sequence[str] = field(default_factory=tuple)
 
-    max_categories: int = 20  # one-hot width cap per column; the rest fold into __other__
-    level_autocorr: float = 0.5  # within-entity lag-1 autocorrelation above which numeric = level
-    infer_sample_rows: int = 200_000  # rows sampled for role inference on large frames
+    max_categories: int = 20        # one-hot width cap; the rest fold into __other__
+    level_persistence: float = 0.15  # persistence above which a numeric column is a level
+    infer_sample_rows: int = 200_000
 
     category_universe: Optional[Dict[str, List[Any]]] = None  # persist and reuse when scoring
 
     # -- optional terminal-event hazard; inert unless the outcome is declared
     event_col: Optional[str] = None
-    # Outcome rows, declared either as a flag column that is set only on them
-    # (the usual shape when outcomes come from a separate table) or as values
-    # within event_col. Either one strips those rows from every feature layer.
     terminal_flag_col: Optional[str] = None
     terminal_event_states: Sequence[Any] = field(default_factory=tuple)
     context_orders: Sequence[int] = (1, 2)
     hazard_min_support: int = 25
     runlen_cap: int = 12
 
+    @property
+    def declares_outcome(self) -> bool:
+        return bool(self.terminal_flag_col or self.terminal_event_states)
+
 
 @dataclass
 class FeatureEngineeringArtifacts:
-    """The feature table plus everything needed to rebuild it identically.
+    """The table plus everything needed to rebuild it identically.
 
-    `column_roles`, `category_universe` and `hazard` are the reusable
-    definitions: pass them back in when scoring a later batch so the schema and
-    the population estimates stay fixed, rather than being re-derived from
-    whatever data happens to arrive next.
+    Pass `column_roles`, `category_universe` and `hazard` back in when scoring a
+    later batch, so the schema and the population estimates stay fixed instead
+    of being re-derived from whatever data arrives next.
     """
 
     table: pd.DataFrame
@@ -222,12 +173,11 @@ class FeatureEngineeringArtifacts:
 def _to_axis(values: Any, unit: str) -> pd.Series:
     """Project timestamps or numbers onto the float axis named by `unit`.
 
-    Days are derived through `total_seconds` rather than by casting to int64
-    and dividing by a nanosecond constant. Since pandas 2.0 a datetime column
-    may be backed by second, millisecond, microsecond or nanosecond
-    resolution, and casting to int64 returns the underlying integer in
-    whichever unit that happens to be -- so the constant is right for one
-    frame and wrong by a factor of a thousand for the next, silently.
+    Days come from `total_seconds`, not from casting to int64 and dividing by a
+    nanosecond constant: since pandas 2.0 a datetime column may be backed by
+    second, millisecond, microsecond or nanosecond resolution, and the cast
+    returns the underlying integer in whichever it is -- right for one frame and
+    wrong by a factor of a thousand for the next, silently.
     """
     series = values if isinstance(values, pd.Series) else pd.Series(values)
     if unit != "day":
@@ -236,17 +186,16 @@ def _to_axis(values: Any, unit: str) -> pd.Series:
     stamps = pd.to_datetime(series, errors="coerce")
     if not pd.api.types.is_datetime64_any_dtype(stamps):
         stamps = pd.to_datetime(series, errors="coerce", utc=True)  # mixed offsets
-    aware = getattr(stamps.dt, "tz", None) is not None
-    epoch = pd.Timestamp("1970-01-01", tz="UTC") if aware else pd.Timestamp("1970-01-01")
+    tz = getattr(stamps.dt, "tz", None)
+    epoch = pd.Timestamp("1970-01-01", tz="UTC") if tz is not None else pd.Timestamp("1970-01-01")
     return (stamps - epoch).dt.total_seconds().where(stamps.notna()) / _SECONDS_PER_DAY
 
 
 def _detect_time_unit(series: pd.Series) -> str:
     """"day" for anything datetime-like, "unit" for a numeric ordering column.
 
-    A numeric column is taken at face value rather than guessed at: an integer
-    that happens to look like 20260101 is treated as the number it is, and
-    windows are then in those units. Convert it yourself if it means a date.
+    A numeric column is taken at face value: an integer that happens to look
+    like 20260101 is the number it is, and windows are then in those units.
     """
     if pd.api.types.is_numeric_dtype(series):
         return "unit"
@@ -261,38 +210,72 @@ def _detect_time_unit(series: pd.Series) -> str:
 
 
 # --------------------------------------------------------------------------
-# Column role inference
+# Column roles
 # --------------------------------------------------------------------------
+
+def _persistence(df: pd.DataFrame, id_col: str, col: str) -> float:
+    """How much a numeric column carries over between an entity's own rows.
+
+    `1 - MSSD / (2 * within-entity variance)`: the mean squared successive
+    difference against twice the variance. For a series with no carry-over the
+    two are equal and this is 0; for one that barely moves between rows the
+    difference term vanishes and it approaches 1. Both halves are unbiased at
+    small n, so unlike a demeaned lag-1 autocorrelation the value does not drift
+    with history length -- an additive column sits at ~0.00 whether entities
+    have three rows or twenty.
+
+    Entities with fewer than three observations of the column are excluded:
+    with two rows the single difference and the single deviation are the same
+    number, so there is no information about persistence to extract. A column
+    seen only on such entities returns 0.0 and is treated as a flow.
+    """
+    valid = df.loc[df[col].notna(), [id_col, col]]
+    valid = valid[valid.groupby(id_col)[col].transform("size") >= 3]
+    if len(valid) < 60 or valid[id_col].nunique() < 20:
+        return 0.0
+
+    grouped = valid.groupby(id_col, sort=False)[col]
+    deviations = valid[col].astype(float) - grouped.transform("mean").astype(float)
+    variance = float((deviations ** 2).sum()) / (len(valid) - valid[id_col].nunique())
+    if variance <= 0:
+        return 0.0
+    mssd = float((grouped.diff().dropna().astype(float) ** 2).mean())
+    return 1.0 - mssd / (2.0 * variance)
+
 
 def infer_column_roles(
     df: pd.DataFrame,
     id_col: str,
     time_col: str,
     max_categories: int = 20,
-    level_autocorr: float = 0.5,
+    level_persistence: float = 0.15,
     sample_rows: int = 200_000,
     ignore_cols: Sequence[str] = (),
 ) -> Dict[str, List[str]]:
-    """Classify every remaining column as static, flow, level, categorical or skipped.
+    """Classify each remaining column as static, flow, level, categorical or skipped.
 
-    The one non-obvious test is flow vs. level. Both are numeric, so dtype
-    cannot separate them, and column names cannot be relied on across datasets.
-    What does separate them is persistence: a balance, a price or a temperature
-    is close to its own previous value within the same entity, while an amount
-    or a quantity is not. So the rule is the pooled within-entity lag-1
-    autocorrelation, computed on entity-mean-centered values so that
-    differences BETWEEN entities cannot masquerade as persistence.
+    The only non-obvious case is flow vs level. Both are numeric, so dtype
+    cannot separate them and names are not reliable across datasets. What does
+    separate them is persistence: a balance is close to what it was last time,
+    a payment amount is not.
 
-    Columns constant within an entity are static regardless of dtype, and
+    Persistence is measured as 1 - MSSD / 2*variance, both taken within entity
+    (see `_persistence`), rather than as a lag-1 autocorrelation of
+    entity-demeaned values. Demeaning inside a short history biases that
+    correlation down by roughly 1/(n-1) -- at two rows per entity it is exactly
+    -1 whatever the column, and it still misreads a balance as a flow at six
+    rows. On transactional data most entities have a handful of rows, so that
+    bias is the common case, not an edge case.
+
+    Columns constant within an entity are static whatever their dtype, and
     non-numeric columns with too many distinct values are skipped rather than
-    encoded -- free text or an identifier would otherwise produce a feature per
-    value.
+    encoded, since free text or an identifier would otherwise yield a feature
+    per value.
     """
     reserved = {id_col, time_col, *ignore_cols}
+    roles: Dict[str, List[str]] = {k: [] for k in
+                                   ("static", "flow", "level", "categorical", "skipped")}
     candidates = [c for c in df.columns if c not in reserved]
-    roles: Dict[str, List[str]] = {
-        "static": [], "flow": [], "level": [], "categorical": [], "skipped": [],
-    }
     if not candidates:
         return roles
 
@@ -301,37 +284,21 @@ def infer_column_roles(
         ids = df[id_col].drop_duplicates()
         keep = ids.sample(n=max(1, int(len(ids) * sample_rows / len(df))), random_state=0)
         sample = df[df[id_col].isin(set(keep))]
-
     sample = sample.sort_values([id_col, time_col], kind="mergesort")
     grouped = sample.groupby(id_col, sort=False)
 
     for col in candidates:
         series = sample[col]
         if series.notna().sum() == 0 or series.nunique(dropna=True) <= 1:
-            roles["skipped"].append(col)  # nothing to learn from a constant
-            continue
-
-        # constant within entity -> a property of the entity, not of its activity
-        if float(grouped[col].nunique(dropna=True).le(1).mean()) >= 0.95:
-            roles["static"].append(col)
-            continue
-
-        if pd.api.types.is_numeric_dtype(series):
-            centered = series.astype(float) - grouped[col].transform("mean").astype(float)
-            lagged = centered.groupby(sample[id_col], sort=False).shift(1)
-            usable = centered.notna() & lagged.notna()
-            if usable.sum() >= 30 and centered[usable].std() > 0 and lagged[usable].std() > 0:
-                persistence = float(np.corrcoef(centered[usable], lagged[usable])[0, 1])
-            else:
-                persistence = 0.0  # too little within-entity history to tell; treat as flow
-            roles["level" if persistence >= level_autocorr else "flow"].append(col)
-            continue
-
-        if pd.api.types.is_datetime64_any_dtype(series):
+            roles["skipped"].append(col)
+        elif float(grouped[col].nunique(dropna=True).le(1).mean()) >= 0.95:
+            roles["static"].append(col)  # a property of the entity, not of its activity
+        elif pd.api.types.is_numeric_dtype(series):
+            score = _persistence(sample, id_col, col)
+            roles["level" if score >= level_persistence else "flow"].append(col)
+        elif pd.api.types.is_datetime64_any_dtype(series):
             roles["skipped"].append(col)  # a second time column needs a role you choose
-            continue
-
-        if series.nunique(dropna=True) <= max(max_categories * 5, 100):
+        elif series.nunique(dropna=True) <= max(max_categories * 5, 100):
             roles["categorical"].append(col)
         else:
             roles["skipped"].append(col)
@@ -339,70 +306,88 @@ def infer_column_roles(
     return roles
 
 
+def zero_diagnostic(df: pd.DataFrame, numeric_col: str, by: str, top: int = 8) -> pd.DataFrame:
+    """Is a zero in `numeric_col` a real zero, or "not applicable to this row"?
+
+    Breaks the zero rate down by another column, normally the one naming the
+    row's type. Zeros concentrated in the types that do not use the column are
+    structural nulls and belong in `zero_is_missing`; zeros spread evenly across
+    every type are real measurements and should stay.
+    """
+    valid = df.loc[df[numeric_col].notna(), [numeric_col, by]]
+    if valid.empty:
+        return pd.DataFrame(columns=[by, "n_rows", "n_zero", "zero_rate", "nonzero_median"])
+    grouped = valid.groupby(by, dropna=False)[numeric_col]
+    out = pd.DataFrame({
+        "n_rows": grouped.size(),
+        "n_zero": grouped.apply(lambda x: int((x == 0).sum())),
+        "nonzero_median": grouped.apply(lambda x: x[x != 0].median()),
+    })
+    out["zero_rate"] = out["n_zero"] / out["n_rows"]
+    return (out.reset_index()[[by, "n_rows", "n_zero", "zero_rate", "nonzero_median"]]
+            .sort_values("zero_rate", ascending=False).head(top).reset_index(drop=True))
+
+
 # --------------------------------------------------------------------------
 # Shared helpers
 # --------------------------------------------------------------------------
 
 def _one_hot(values: pd.Series, prefix: str, universe: Sequence[Any]) -> pd.DataFrame:
-    """One column per `universe` entry, in order, plus an always-present `__other__`.
+    """One column per `universe` entry plus an always-present `__other__`.
 
     `__other__` is emitted even when empty so the schema depends only on the
     universe: a training table and a scoring table built from the same universe
-    have identical columns whether or not the new batch contains an unseen
-    value. NaN encodes as all zeros.
+    have identical columns whether or not the new batch holds an unseen value.
+    NaN encodes as all zeros.
     """
-    columns = list(universe) + ["__other__"]
     known = values.where(values.isin(universe) | values.isna(), other="__other__")
     return pd.DataFrame(
-        {f"{prefix}_{cat}": (known == cat).astype("int8") for cat in columns},
+        {f"{prefix}_{cat}": (known == cat).astype("int8") for cat in list(universe) + ["__other__"]},
         index=values.index,
     )
 
 
-def _universe_for(
-    values: pd.Series, col: str, universe: Dict[str, List[Any]], max_categories: int,
-) -> List[Any]:
+def _universe_for(values: pd.Series, col: str, universe: Dict[str, List[Any]], cap: int) -> List[Any]:
     """Fixed category list for `col`, keeping the most frequent when capped."""
-    if col in universe:
-        return universe[col]
-    counts = values.value_counts()
-    chosen = sorted(counts.index[:max_categories].tolist(), key=str)
-    universe[col] = chosen
-    return chosen
+    if col not in universe:
+        universe[col] = sorted(values.value_counts().index[:cap].tolist(), key=str)
+    return universe[col]
 
 
 def _positional(work: pd.DataFrame, id_col: str, cols: Sequence[str]) -> Dict[str, pd.DataFrame]:
-    """First / previous / last non-null value per entity, for several columns.
+    """First / previous / last non-null value per entity. Rows must be sorted.
 
-    Rows must already be sorted by (id, time). Nulls are dropped per column,
-    which is why this is not one groupby over all of them: the last KNOWN
-    balance is rarely the balance on the entity's last row.
+    `prev` comes from tail(2) rather than nth(-2): as of pandas 2.0 nth returns
+    rows on the ORIGINAL index instead of one value per group, which misaligns
+    silently when reindexed by entity.
     """
     out: Dict[str, pd.DataFrame] = {}
     for col in cols:
         valid = work.loc[work[col].notna(), [id_col, col]]
         grouped = valid.groupby(id_col, sort=False)[col]
-
-        # `prev` via tail(2) rather than nth(-2): as of pandas 2.0 nth returns
-        # rows on the ORIGINAL index instead of one value per group, which
-        # silently misaligns when reindexed by entity. tail(2).first() is the
-        # second-to-last value, masked off where the entity has only one row.
         tail = valid.groupby(id_col, sort=False).tail(2).groupby(id_col, sort=False)[col]
         out[col] = pd.DataFrame({
-            "first": grouped.first(),
-            "last": grouped.last(),
+            "first": grouped.first(), "last": grouped.last(),
             "prev": tail.first().where(tail.size() == 2),
         })
     return out
 
 
-def _window_masks(
-    work: pd.DataFrame, cutoff_col: str, time_col: str, windows: Sequence[float],
-) -> Dict[float, pd.Series]:
-    return {
-        float(w): (work[time_col] > work[cutoff_col] - float(w)) & (work[time_col] <= work[cutoff_col])
-        for w in windows
-    }
+def _subsets(work: pd.DataFrame, cfg: FeatureEngineeringConfig) -> Tuple[Dict[str, pd.Series], List[str]]:
+    """Masks naming each "recent" slice, plus which of them are calendar windows.
+
+    Rows are already filtered to at-or-before the cutoff, so a calendar window
+    only needs its lower bound.
+    """
+    masks: Dict[str, pd.Series] = {}
+    if len(cfg.recent_events):
+        rank = work.groupby(cfg.id_col, sort=False).cumcount(ascending=False)
+        for k in cfg.recent_events:
+            masks[f"last{int(k)}"] = rank < int(k)
+    window_tags = [f"w{float(w):g}" for w in cfg.recent_windows]
+    for tag, w in zip(window_tags, cfg.recent_windows):
+        masks[tag] = work[_T] > work[_CUT] - float(w)
+    return masks, window_tags
 
 
 # --------------------------------------------------------------------------
@@ -411,55 +396,56 @@ def _window_masks(
 
 def _activity_layer(
     work: pd.DataFrame, cfg: FeatureEngineeringConfig, cutoff: pd.Series,
-    windows: Dict[float, pd.Series],
+    masks: Dict[str, pd.Series], window_tags: Sequence[str],
 ) -> pd.DataFrame:
     """Recency, frequency, tenure and rhythm -- the one family every log supports."""
     id_col = cfg.id_col
-    grouped = work.groupby(id_col, sort=False)["__t__"]
+    grouped = work.groupby(id_col, sort=False)[_T]
+    first, last = grouped.min(), grouped.max()
 
-    out = pd.DataFrame({"n_events": grouped.size(), "__first": grouped.min(), "__last": grouped.max()})
-    out["tenure"] = out["__last"] - out["__first"]
-    out["recency"] = cutoff.reindex(out.index) - out["__last"]
+    out = pd.DataFrame({"n_events": grouped.size()})
+    out["tenure"] = last - first
+    out["recency"] = cutoff.reindex(out.index) - last
 
-    by_id = work["__t__"].groupby(work[id_col], sort=False).diff().groupby(work[id_col], sort=False)
-    out["gap_median"] = by_id.median()
-    out["gap_last"] = by_id.last()
-    # >1 means the entity's latest gap is longer than its own norm: cooling off.
-    # Scale-free, so it compares entities with very different natural rhythms.
-    out["gap_burstiness"] = out["gap_last"] / out["gap_median"].replace(0, np.nan)
+    gaps = work[_T].groupby(work[id_col], sort=False).diff().groupby(work[id_col], sort=False)
+    out["gap_median"] = gaps.median()
+    out["gap_last"] = gaps.last()
     out["events_per_unit"] = out["n_events"] / out["tenure"].replace(0, np.nan)
 
-    for window, mask in windows.items():
-        counts = work.loc[mask].groupby(id_col, sort=False).size()
-        out[f"n_events_w{window:g}"] = counts.reindex(out.index).fillna(0).astype(int)
+    # Raw durations are not comparable between an entity transacting weekly and
+    # one transacting every other year. Dividing by the entity's own median gap
+    # gives the same quantity in units of its own rhythm: >1 means overdue.
+    typical = out["gap_median"].replace(0, np.nan)
+    out["recency_ratio"] = out["recency"] / typical
+    out["gap_burstiness"] = out["gap_last"] / typical
 
-    return out.drop(columns=["__first", "__last"])
+    for tag in window_tags:  # a count over the last k events is just min(k, n_events)
+        counts = work.loc[masks[tag]].groupby(id_col, sort=False).size()
+        out[f"n_events_{tag}"] = counts.reindex(out.index).fillna(0).astype(int)
+    return out
 
 
 def _flow_layer(
     work: pd.DataFrame, cfg: FeatureEngineeringConfig, cols: Sequence[str],
-    windows: Dict[float, pd.Series], index: pd.Index,
+    masks: Dict[str, pd.Series], index: pd.Index,
 ) -> pd.DataFrame:
     """Additive quantities: how much in total, how much typically, how much lately."""
     if not cols:
         return pd.DataFrame(index=index)
-
     cols = list(cols)
-    overall = work.groupby(cfg.id_col, sort=False)[cols].agg(["sum", "mean", "max"])
-    overall.columns = [f"{col}_{stat}" for col, stat in overall.columns]
-    frames = [overall]
 
-    positions = _positional(work, cfg.id_col, cols)
-    frames.append(pd.DataFrame({f"{col}_last": positions[col]["last"] for col in cols}))
+    def agg(frame: pd.DataFrame, stats: Sequence[str], suffix: str = "") -> pd.DataFrame:
+        out = frame.groupby(cfg.id_col, sort=False)[cols].agg(list(stats))
+        out.columns = [f"{c}_{s}{suffix}" for c, s in out.columns]
+        return out
 
-    for window, mask in windows.items():
-        windowed = work.loc[mask].groupby(cfg.id_col, sort=False)[cols].agg(["sum", "mean"])
-        windowed.columns = [f"{col}_{stat}_w{window:g}" for col, stat in windowed.columns]
-        frames.append(windowed)
+    frames = [agg(work, ("sum", "mean", "max"))]
+    frames.append(pd.DataFrame({f"{c}_last": _positional(work, cfg.id_col, cols)[c]["last"]
+                                for c in cols}))
+    frames += [agg(work.loc[m], ("sum", "mean"), f"_{tag}") for tag, m in masks.items()]
 
     out = pd.concat([f.reindex(index) for f in frames], axis=1)
-    # a window the entity was present for but inactive in truly moved zero
-    sums = [c for c in out.columns if "_sum" in c]
+    sums = [c for c in out.columns if "_sum" in c]  # inactive but present means zero moved
     out[sums] = out[sums].fillna(0.0)
     return out
 
@@ -470,17 +456,15 @@ def _level_layer(
     """Snapshots: where the entity stands now, and how it got there.
 
     Change is measured against the entity's own previous and first observations
-    rather than a calendar window. That keeps it defined on short histories and
-    free of any assumption about cadence -- a window-based delta is null for
-    every entity whose history is shorter than the window, which on
-    transactional data is most of them.
+    rather than a calendar window, which keeps it defined on short histories and
+    free of any assumption about cadence.
     """
     if not cols:
         return pd.DataFrame(index=index)
-
     cols = list(cols)
+
     out = work.groupby(cfg.id_col, sort=False)[cols].agg(["min", "max"])
-    out.columns = [f"{col}_{stat}" for col, stat in out.columns]
+    out.columns = [f"{c}_{s}" for c, s in out.columns]
 
     positions = _positional(work, cfg.id_col, cols)
     for col in cols:
@@ -491,7 +475,6 @@ def _level_layer(
         out[f"{col}_pct_change_total"] = (
             out[f"{col}_delta_total"] / pos["first"].replace(0, np.nan)
         ).replace([np.inf, -np.inf], np.nan)
-
     return out.reindex(index)
 
 
@@ -501,38 +484,34 @@ def _categorical_layer(
 ) -> pd.DataFrame:
     """Variety, concentration and current value of each label column.
 
-    Concentration is a top-value share rather than a raw distinct count because
-    distinct counts are bounded by the number of rows, which makes them largely
-    a restatement of n_events on short histories.
+    Concentration is a top-value share rather than a raw distinct count, since
+    distinct counts are bounded by the number of rows and so largely restate
+    n_events on short histories.
     """
     if not cols:
         return pd.DataFrame(index=index)
 
-    id_col = cfg.id_col
-    frames: List[pd.DataFrame] = []
-    encoded: List[str] = []
-
+    id_col, frames, encoded = cfg.id_col, [], []
     for col in cols:
         valid = work.loc[work[col].notna(), [id_col, col]]
-        by_entity = valid.groupby([id_col, col], sort=False).size().groupby(level=0)
+        by_id = valid.groupby(id_col, sort=False)
+        per_value = valid.groupby([id_col, col], sort=False).size().groupby(level=0)
 
         stats = pd.DataFrame({
-            f"{col}_n_distinct": by_entity.size(),
-            f"{col}_top_share": by_entity.max() / by_entity.sum().replace(0, np.nan),
+            f"{col}_n_distinct": per_value.size(),
+            f"{col}_top_share": per_value.max() / per_value.sum().replace(0, np.nan),
         })
+        # consecutive rows the entity has now spent on its current value
+        changed = (valid[col] != by_id[col].shift()).astype(int)
+        run = changed.groupby(valid[id_col], sort=False).cumsum()
+        stats[f"{col}_run_len"] = (
+            (run == run.groupby(valid[id_col], sort=False).transform("max"))
+            .groupby(valid[id_col], sort=False).sum()
+        )
 
-        # how many consecutive rows the entity has now spent on its current value
-        current = valid[col]
-        by_id = valid.groupby(id_col, sort=False)
-        changed = (current != by_id[col].shift()).astype(int)
-        run_id = changed.groupby(valid[id_col], sort=False).cumsum()
-        in_last_run = run_id == run_id.groupby(valid[id_col], sort=False).transform("max")
-        stats[f"{col}_run_len"] = in_last_run.groupby(valid[id_col], sort=False).sum()
-
-        last_value = by_id[col].last()
-        one_hot = _one_hot(last_value, f"{col}_last", _universe_for(
-            last_value, col, universe, cfg.max_categories))
-        encoded.extend(one_hot.columns)
+        last = by_id[col].last()
+        one_hot = _one_hot(last, f"{col}_last", _universe_for(last, col, universe, cfg.max_categories))
+        encoded += list(one_hot.columns)
         frames.append(pd.concat([stats, one_hot], axis=1))
 
     out = pd.concat([f.reindex(index) for f in frames], axis=1)
@@ -548,17 +527,14 @@ def _static_layer(
     if not cols:
         return pd.DataFrame(index=index)
 
-    positions = _positional(work, cfg.id_col, cols)
-    frames: List[pd.DataFrame] = []
-    encoded: List[str] = []
+    positions, frames, encoded = _positional(work, cfg.id_col, cols), [], []
     for col in cols:
-        last_value = positions[col]["last"]
+        last = positions[col]["last"]
         if pd.api.types.is_numeric_dtype(work[col]):
-            frames.append(last_value.rename(col).to_frame())
+            frames.append(last.rename(col).to_frame())
         else:
-            one_hot = _one_hot(last_value, col, _universe_for(
-                last_value, col, universe, cfg.max_categories))
-            encoded.extend(one_hot.columns)
+            one_hot = _one_hot(last, col, _universe_for(last, col, universe, cfg.max_categories))
+            encoded += list(one_hot.columns)
             frames.append(one_hot)
 
     out = pd.concat([f.reindex(index) for f in frames], axis=1)
@@ -574,15 +550,15 @@ def _static_layer(
 class HazardModel:
     """Population discrete-time hazard of a once-only terminal event.
 
-    `by_order[k][context]` and `by_runlen[n]` hold (n_at_risk, n_events). The
-    parallel `own_*` maps hold each entity's own contribution to those cells,
-    which is what lets a per-entity feature be read leave-one-out. That
-    subtraction is not cosmetic: the hazard is fit on data containing each
-    entity's own outcome, so a positive sitting in a thinly-populated context
-    would otherwise read its own label back out of the population rate.
+    `by_order[k][context]` and `by_runlen[n]` hold (n_at_risk, n_events); the
+    parallel `own_*` maps hold each entity's own contribution, which is what
+    lets a per-entity feature be read leave-one-out. That subtraction is not
+    cosmetic: the hazard is fit on data containing each entity's own outcome, so
+    a positive in a thin context would otherwise read its own label back out of
+    the population rate.
 
-    Reuse this when scoring a later batch. Entities absent from `own_*`
-    subtract nothing, which is correct for ones the model has not seen.
+    Reuse this when scoring later. Entities absent from `own_*` subtract
+    nothing, which is correct for ones the model has not seen.
     """
 
     base: Counts
@@ -599,65 +575,46 @@ class HazardModel:
         return e / n if n else float("nan")
 
     def to_frame(self) -> pd.DataFrame:
-        """Long-format view of the fitted rates, for inspection."""
-        rows: List[Dict[str, Any]] = []
-        for n_obs, (n, e) in sorted(self.by_runlen.items()):
-            rows.append({"kind": "runlen", "context": n_obs,
-                         "n_at_risk": n, "n_events": e, "rate": e / n if n else np.nan})
-        for order in sorted(self.by_order):
-            for ctx, (n, e) in self.by_order[order].items():
-                rows.append({"kind": f"order{order}", "context": "_".join(str(x) for x in ctx),
-                             "n_at_risk": n, "n_events": e, "rate": e / n if n else np.nan})
+        """Long-format view of the fitted rates. A flat `rate` across contexts
+        means the chosen `event_col` does not discriminate."""
+        rows = [{"kind": "runlen", "context": n_obs, "n_at_risk": n, "n_events": e,
+                 "rate": e / n if n else np.nan}
+                for n_obs, (n, e) in sorted(self.by_runlen.items())]
+        rows += [{"kind": f"order{order}", "context": "_".join(map(str, ctx)),
+                  "n_at_risk": n, "n_events": e, "rate": e / n if n else np.nan}
+                 for order in sorted(self.by_order)
+                 for ctx, (n, e) in self.by_order[order].items()]
         if not rows:
             return pd.DataFrame(columns=["kind", "context", "n_at_risk", "n_events", "rate"])
-        return (pd.DataFrame(rows)
-                .sort_values(["kind", "n_at_risk"], ascending=[True, False])
+        return (pd.DataFrame(rows).sort_values(["kind", "n_at_risk"], ascending=[True, False])
                 .reset_index(drop=True))
 
 
-def _terminal_mask(work: pd.DataFrame, cfg: FeatureEngineeringConfig) -> pd.Series:
-    """Rows that mark the outcome, from a flag column or from event_col values.
-
-    A flag counts as set when it is non-null and not zero, so 1/True/"Y" all
-    work and an all-null column on non-outcome rows is simply absent.
-    """
-    mask = pd.Series(False, index=work.index)
-    if cfg.terminal_flag_col:
-        if cfg.terminal_flag_col not in work.columns:
-            raise KeyError(f"terminal_flag_col '{cfg.terminal_flag_col}' not found in input dataframe")
-        flag = work[cfg.terminal_flag_col]
-        mask |= flag.notna() & (flag != 0)
-    if cfg.terminal_event_states and cfg.event_col:
-        mask |= work[cfg.event_col].isin(set(cfg.terminal_event_states))
-    return mask
-
-
-def _sequences(df: pd.DataFrame, id_col: str, value_col: str) -> Dict[Hashable, List[Any]]:
+def _sequences(df: pd.DataFrame, id_col: str) -> Dict[Hashable, List[Any]]:
     """Each entity's states, oldest first, nulls dropped. Rows must be sorted."""
-    valid = df.loc[df[value_col].notna(), [id_col, value_col]]
-    return {id_: list(states) for id_, states in valid.groupby(id_col, sort=False)[value_col]}
+    valid = df.loc[df[_STATE].notna(), [id_col, _STATE]]
+    return {i: list(states) for i, states in valid.groupby(id_col, sort=False)[_STATE]}
 
 
 def _fit_hazard(
-    sequences: Dict[Hashable, List[Any]], terminal: set, orders: Sequence[int], runlen_cap: int,
+    sequences: Dict[Hashable, List[Any]], orders: Sequence[int], runlen_cap: int,
 ) -> HazardModel:
     """Person-period expansion: one at-risk row per observation before the event.
 
     Each row carries a 1 if the terminal event followed it and a 0 otherwise. An
     entity that never reached the event contributes all of its observations as
-    zeros, INCLUDING its last one -- that is a known non-event rather than a
-    censored row, because the observation window runs past it, which is what
-    makes the entity a negative.
+    zeros INCLUDING its last, which is a known non-event rather than a censored
+    row, because the observation window runs past it -- that is what makes the
+    entity a negative.
 
-    Dropping that final observation would remove only zeros, and only from the
+    Dropping that final observation would remove only zeros, and only from
     entities that never converted, biasing every rate upward by roughly one over
     the mean history length. On short histories that is not a rounding error: it
     inflated the strongest context by ~40% in testing.
 
     The exception is a history truncated by the data pull rather than by the
-    label window, where the last row's outcome is genuinely unknown and counting
-    it as a zero is optimistic. Exclude such entities from the fitting
-    population, or fit on an earlier window and pass the model in prefit.
+    label window, where the last row's outcome is genuinely unknown. Exclude
+    such entities, or fit on an earlier window and pass the model in prefit.
     """
     base = [0, 0]
     own_base: Dict[Hashable, List[int]] = defaultdict(lambda: [0, 0])
@@ -668,54 +625,42 @@ def _fit_hazard(
 
     for id_, states in sequences.items():
         for i, state in enumerate(states):
-            if state in terminal:
+            if state == _TERMINAL:
                 break  # the window ended here; nothing after it is at risk
-            event = 1 if i + 1 < len(states) and states[i + 1] in terminal else 0
-
-            for cell in (base, own_base[id_]):
-                cell[0] += 1
-                cell[1] += event
-
+            event = int(i + 1 < len(states) and states[i + 1] == _TERMINAL)
             bucket = min(i + 1, runlen_cap)
-            for cell in (by_runlen[bucket], own_by_runlen[(id_, bucket)]):
+
+            cells = [base, own_base[id_], by_runlen[bucket], own_by_runlen[(id_, bucket)]]
+            for order in orders:
+                if i + 1 >= order:
+                    ctx = tuple(states[i - order + 1 : i + 1])
+                    cells += [by_order[order][ctx], own_by_order[order][(id_, ctx)]]
+            for cell in cells:
                 cell[0] += 1
                 cell[1] += event
-
-            for order in orders:
-                if i + 1 < order:
-                    continue
-                ctx = tuple(states[i - order + 1 : i + 1])
-                for cell in (by_order[order][ctx], own_by_order[order][(id_, ctx)]):
-                    cell[0] += 1
-                    cell[1] += event
 
     def freeze(counter: Dict[Any, List[int]]) -> Dict[Any, Counts]:
-        return {key: (val[0], val[1]) for key, val in counter.items()}
+        return {k: (v[0], v[1]) for k, v in counter.items()}
 
     return HazardModel(
         base=(base[0], base[1]),
-        by_order={k: freeze(v) for k, v in by_order.items()},
-        by_runlen=freeze(by_runlen),
+        by_order={k: freeze(v) for k, v in by_order.items()}, by_runlen=freeze(by_runlen),
         own_base=freeze(own_base),
         own_by_order={k: freeze(v) for k, v in own_by_order.items()},
-        own_by_runlen=freeze(own_by_runlen),
-        runlen_cap=runlen_cap,
+        own_by_runlen=freeze(own_by_runlen), runlen_cap=runlen_cap,
     )
 
 
 def _loo_rate(total: Optional[Counts], own: Counts, min_support: int) -> Optional[float]:
     """Population rate for one context with `own`'s contribution removed.
 
-    None means the context is too thin to trust once the entity's own rows are
-    taken out, and the caller should back off to a shorter context.
+    None means the context is too thin once the entity's own rows are out, and
+    the caller should back off to a shorter context.
     """
     if total is None:
         return None
-    n_at_risk = total[0] - own[0]
-    n_events = total[1] - own[1]
-    if n_at_risk < min_support or n_at_risk <= 0:
-        return None
-    return n_events / n_at_risk
+    n, e = total[0] - own[0], total[1] - own[1]
+    return e / n if n >= max(min_support, 1) else None
 
 
 def _hazard_layer(
@@ -724,68 +669,57 @@ def _hazard_layer(
 ) -> Tuple[pd.DataFrame, Optional[HazardModel]]:
     """How likely the terminal event is from where each entity currently stands.
 
-    `fit_df` still contains the terminal-event rows and is used only to fit the
-    population hazard. `work` has them stripped and is the only frame any
-    per-entity feature is read from.
+    `fit_df` still holds the outcome rows and is used only to fit the population
+    hazard; `work` has them stripped and is the only frame a per-entity feature
+    is read from.
     """
     id_col = cfg.id_col
-    terminal = {_TERMINAL}
     orders = sorted({int(k) for k in cfg.context_orders if int(k) >= 1}, reverse=True)
 
-    # With one distinct non-outcome state there is nothing to condition on, so
-    # every context feature would be the same number for every entity. Emit the
-    # run-length hazard alone rather than three constant columns.
+    # One distinct non-outcome state leaves nothing to condition on, so every
+    # context feature would hold the same number for every entity.
     has_context = int(work[_STATE].nunique(dropna=True)) >= 2
     if not has_context:
         warnings.warn(
             "no event_col, or only one distinct state, so there is no context to condition on -- "
-            "emitting hazard_runlen only. Set event_col to a behavioural state column to get the "
-            "context hazard as well."
+            "emitting hazard_runlen only. Set event_col to a per-row categorical for the rest."
         )
 
     hazard = prefit
     if hazard is None:
-        fit_seqs = _sequences(fit_df.sort_values([id_col, "__t__"], kind="mergesort"),
-                              id_col, _STATE)
+        fit_seqs = _sequences(fit_df, id_col)
         if not fit_seqs:
             warnings.warn("no usable history; hazard features skipped")
             return pd.DataFrame(index=index), None
-        hazard = _fit_hazard(fit_seqs, terminal, orders, cfg.runlen_cap)
+        hazard = _fit_hazard(fit_seqs, orders, cfg.runlen_cap)
 
     rows: List[Dict[str, Any]] = []
-    for id_, states in _sequences(work, id_col, _STATE).items():
+    for id_, states in _sequences(work, id_col).items():
         n_obs = len(states)
-        base_rate = _loo_rate(hazard.base, hazard.own_base.get(id_, (0, 0)), 1)
-        if base_rate is None:
-            base_rate = hazard.base_rate
+        base = _loo_rate(hazard.base, hazard.own_base.get(id_, (0, 0)), 1)
+        base = hazard.base_rate if base is None else base
 
         bucket = min(n_obs, hazard.runlen_cap)
-        by_runlen = _loo_rate(
-            hazard.by_runlen.get(bucket), hazard.own_by_runlen.get((id_, bucket), (0, 0)),
-            cfg.hazard_min_support,
-        )
+        runlen = _loo_rate(hazard.by_runlen.get(bucket),
+                           hazard.own_by_runlen.get((id_, bucket), (0, 0)), cfg.hazard_min_support)
+        row = {id_col: id_, "hazard_runlen": base if runlen is None else runlen}
 
-        context_rate, context_order = None, 0
-        for order in orders:  # longest context first, backing off when too thin
-            if n_obs < order:
-                continue
-            ctx = tuple(states[-order:])
-            rate = _loo_rate(
-                hazard.by_order[order].get(ctx),
-                hazard.own_by_order[order].get((id_, ctx), (0, 0)),
-                cfg.hazard_min_support,
-            )
-            if rate is not None:
-                context_rate, context_order = rate, order
-                break
-        if context_rate is None:
-            context_rate = base_rate
-
-        row = {id_col: id_, "hazard_runlen": base_rate if by_runlen is None else by_runlen}
         if has_context:
-            row["hazard_context"] = context_rate
-            row["hazard_context_order"] = context_order  # 0 = fell back to the base rate
-            row["hazard_lift"] = context_rate / base_rate if base_rate else np.nan
+            rate, used = None, 0
+            for order in orders:  # longest context first, backing off when thin
+                if n_obs < order:
+                    continue
+                ctx = tuple(states[-order:])
+                rate = _loo_rate(hazard.by_order[order].get(ctx),
+                                 hazard.own_by_order[order].get((id_, ctx), (0, 0)),
+                                 cfg.hazard_min_support)
+                if rate is not None:
+                    used = order
+                    break
+            rate = base if rate is None else rate
+            row["hazard_context"] = rate
+            row["hazard_context_order"] = used  # 0 = fell back to the base rate
+            row["hazard_lift"] = rate / base if base else np.nan
         rows.append(row)
 
     if not rows:
@@ -794,63 +728,35 @@ def _hazard_layer(
 
 
 # --------------------------------------------------------------------------
-# Orchestration
+# Cutoffs
 # --------------------------------------------------------------------------
 
 def _resolve_cutoff(work: pd.DataFrame, id_col: str, as_of: Any, unit: str) -> pd.Series:
     """Per-entity cutoff on the float time axis.
 
     None means one cutoff for the whole population at the latest timestamp in
-    the data. The alternative that looks natural -- each entity's own last row
-    -- makes `recency` identically zero for everyone, so it is not a default.
+    the data. Each entity's own last row looks like the natural default and is
+    not offered, because it makes `recency` identically zero.
     """
     ids = pd.Index(work[id_col].unique(), name=id_col)
     if as_of is None:
-        return pd.Series(float(work["__t__"].max()), index=ids)
-
+        return pd.Series(float(work[_T].max()), index=ids)
     if isinstance(as_of, dict):
         as_of = pd.Series(as_of)
-    if isinstance(as_of, pd.Series):
-        cutoff = _to_axis(as_of, unit)
-        cutoff.index = as_of.index
-        cutoff = cutoff.reindex(ids)
-        missing = cutoff.isna()
-        if missing.any():
-            warnings.warn(
-                f"{int(missing.sum())} entity/entities have no as_of value; falling back to the "
-                "population maximum. Pass a cutoff for every entity to avoid mixing cutoffs."
-            )
-            cutoff = cutoff.fillna(float(work["__t__"].max()))
-        cutoff.index.name = id_col
-        return cutoff
+    if not isinstance(as_of, pd.Series):
+        return pd.Series(float(_to_axis([as_of], unit).iloc[0]), index=ids)
 
-    return pd.Series(float(_to_axis([as_of], unit).iloc[0]), index=ids)
-
-
-def zero_diagnostic(
-    df: pd.DataFrame, numeric_col: str, by: str, top: int = 8,
-) -> pd.DataFrame:
-    """Is a zero in `numeric_col` a real zero, or "not applicable to this row"?
-
-    Breaks the zero rate down by another column -- normally the one naming the
-    row's type. Zeros concentrated in the types that do not use the column are
-    structural nulls; zeros spread evenly across every type are real
-    measurements. Mixed is mixed, and then the honest choice is to keep them and
-    let `{col}_zero_share` stand in for whatever the pattern means, rather than
-    guessing per row.
-    """
-    valid = df.loc[df[numeric_col].notna(), [numeric_col, by]]
-    if valid.empty:
-        return pd.DataFrame(columns=[by, "n_rows", "n_zero", "zero_rate", "nonzero_median"])
-    grouped = valid.groupby(by, dropna=False)[numeric_col]
-    out = pd.DataFrame({
-        "n_rows": grouped.size(),
-        "n_zero": grouped.apply(lambda x: int((x == 0).sum())),
-        "nonzero_median": grouped.apply(lambda x: x[x != 0].median()),
-    })
-    out["zero_rate"] = out["n_zero"] / out["n_rows"]
-    return (out.reset_index()[[by, "n_rows", "n_zero", "zero_rate", "nonzero_median"]]
-            .sort_values("zero_rate", ascending=False).head(top).reset_index(drop=True))
+    cutoff = _to_axis(as_of, unit)
+    cutoff.index = as_of.index
+    cutoff = cutoff.reindex(ids)
+    if cutoff.isna().any():
+        warnings.warn(
+            f"{int(cutoff.isna().sum())} entity/entities have no as_of value; falling back to the "
+            "population maximum. Pass a cutoff for every entity to avoid mixing cutoffs."
+        )
+        cutoff = cutoff.fillna(float(work[_T].max()))
+    cutoff.index.name = id_col
+    return cutoff
 
 
 def matched_cutoffs(
@@ -864,39 +770,30 @@ def matched_cutoffs(
 ) -> pd.Series:
     """Per-entity `as_of` cutoffs whose DISTRIBUTION matches across classes.
 
-    The obvious sampling design -- cut every positive at its outcome date and
-    every negative at today -- makes the cutoff itself a function of the label.
-    Recency is then measured to a recent date for one class and to a date years
-    in the past for the other, so it separates the classes without carrying any
-    information about who converts. Measured on simulated data with this shape,
+    Cutting every positive at its outcome date and every negative at today makes
+    the cutoff a function of the label. Recency then runs to a recent date for
+    one class and to a date years back for the other, separating them without
+    carrying information about who converts. On simulated data with that shape
     it handed `recency` 0.32 of spurious AUC and pushed five other timing
-    features off 0.5 as well. Nothing about it looks wrong in a per-feature
-    screen, because no single feature dominates.
+    features off 0.5. A per-feature screen does not reveal it, because no single
+    feature dominates.
 
-    This gives each negative a PSEUDO-outcome date instead: a waiting time
-    resampled from the positives, measured from the entity's own first row, so
-    negatives are observed at the same points in their life cycle as positives.
-    Positives keep their real outcome date.
+    Each negative instead gets a pseudo-outcome date: a waiting time resampled
+    from the positives, measured from its own first row, so both classes are
+    observed at comparable points in their life cycle. Positives keep their real
+    date.
 
     Parameters
     ----------
-    outcome_at : outcome timestamp per positive entity. Everything else in `df`
-        is treated as a negative.
+    outcome_at : outcome timestamp per positive; everything else is a negative.
     strata : optional column to resample within (e.g. line of business), for
-        when waiting times differ by segment. Entities in a stratum with no
-        positives fall back to the pooled distribution.
-    upper_bound : cutoffs are clipped to this (default: the latest timestamp in
-        `df`), so no cutoff lands beyond the observable window.
-
-    Returns
-    -------
-    Series indexed by entity id, ready to pass as `build_feature_table(as_of=)`.
+        when waiting times differ by segment. Strata with too few positives fall
+        back to the pooled distribution.
+    upper_bound : cutoffs are clipped here (default: the latest timestamp in
+        `df`), so none lands beyond the observable window.
     """
     rng = np.random.default_rng(seed)
-    if isinstance(outcome_at, dict):
-        outcome_at = pd.Series(outcome_at)
-    outcome_at = pd.to_datetime(outcome_at)
-
+    outcome_at = pd.to_datetime(pd.Series(outcome_at))
     stamps = pd.to_datetime(df[time_col])
     first_seen = stamps.groupby(df[id_col]).min()
     ids = first_seen.index
@@ -906,49 +803,147 @@ def matched_cutoffs(
     if positives.empty:
         raise ValueError("outcome_at holds no entity present in df; nothing to resample from")
 
-    def offsets_for(pool: pd.Index) -> np.ndarray:
+    def offsets(pool: pd.Index) -> np.ndarray:
         days = (positives.reindex(pool).dropna() - first_seen.reindex(pool)).dt.days
         return days[days.notna() & (days >= 0)].to_numpy()
 
-    pooled = offsets_for(ids)
+    pooled = offsets(ids)
     if pooled.size == 0:
         raise ValueError("no positive has a non-negative waiting time; check outcome_at against df")
 
+    entity_stratum = df.groupby(id_col)[strata].first() if strata else None
     by_stratum: Dict[Any, np.ndarray] = {}
-    entity_stratum: Optional[pd.Series] = None
-    if strata is not None:
-        entity_stratum = df.groupby(id_col)[strata].first()
+    if entity_stratum is not None:
         for value, group in entity_stratum.groupby(entity_stratum):
-            drawn = offsets_for(group.index)
+            drawn = offsets(group.index)
             if drawn.size >= 20:  # too few to resample from meaningfully
                 by_stratum[value] = drawn
 
     negatives = ids.difference(positives.index)
-    draws = np.empty(len(negatives), dtype=float)
-    for i, entity in enumerate(negatives):
-        pool = pooled
-        if entity_stratum is not None:
-            pool = by_stratum.get(entity_stratum.get(entity), pooled)
-        draws[i] = rng.choice(pool)
+    draws = np.array([
+        rng.choice(by_stratum.get(entity_stratum.get(e), pooled) if entity_stratum is not None
+                   else pooled)
+        for e in negatives
+    ], dtype=float)
 
     cutoff = pd.concat([
         positives,
-        pd.Series(first_seen.reindex(negatives) + pd.to_timedelta(draws, unit="D"),
-                  index=negatives),
+        pd.Series(first_seen.reindex(negatives) + pd.to_timedelta(draws, unit="D"), index=negatives),
     ]).reindex(ids)
 
-    # never before the entity's own first row, never past the observable window
-    floor = first_seen + pd.Timedelta(days=1)
+    floor = first_seen + pd.Timedelta(days=1)  # never before the entity's own first row
     cutoff = cutoff.where(cutoff >= floor, floor).clip(upper=cap)
-    beyond = int((cutoff >= cap).sum())
-    if beyond:
+    if int((cutoff >= cap).sum()):
         warnings.warn(
-            f"{beyond} entity/entities drew a pseudo-cutoff at or past the end of the data and "
-            "were clipped to it. Their cutoffs are no longer matched -- consider excluding them, "
-            "or stratifying so the resampled waiting times suit their tenure."
+            f"{int((cutoff >= cap).sum())} entity/entities drew a pseudo-cutoff at or past the end "
+            "of the data and were clipped to it. Their cutoffs are no longer matched -- exclude "
+            "them, or stratify so the resampled waiting times suit their tenure."
         )
     cutoff.index.name = id_col
     return cutoff
+
+
+# --------------------------------------------------------------------------
+# Orchestration
+# --------------------------------------------------------------------------
+
+def _prepare(
+    df: pd.DataFrame, cfg: FeatureEngineeringConfig, as_of: Any,
+) -> Tuple[pd.DataFrame, pd.Series, str]:
+    """Coerce time, blank structural zeros, apply the cutoff, sort."""
+    for col in (cfg.id_col, cfg.time_col):
+        if col not in df.columns:
+            raise KeyError(f"column '{col}' not found in input dataframe")
+
+    unit = _detect_time_unit(df[cfg.time_col])
+    work = df.copy()
+    work[_T] = _to_axis(work[cfg.time_col], unit)
+
+    for col in cfg.zero_is_missing:
+        if col not in work.columns:
+            raise KeyError(f"zero_is_missing names '{col}', which is not in the input dataframe")
+        if pd.api.types.is_numeric_dtype(work[col]):
+            work[col] = work[col].replace(0, np.nan)
+        else:
+            warnings.warn(f"zero_is_missing names '{col}', which is not numeric; ignoring it")
+
+    if work[_T].isna().any():
+        warnings.warn(f"dropping {int(work[_T].isna().sum())} row(s) with an unusable {cfg.time_col}")
+        work = work[work[_T].notna()]
+    if work.empty:
+        raise ValueError("no rows with a usable timestamp")
+
+    cutoff = _resolve_cutoff(work, cfg.id_col, as_of, unit)
+    work = work[work[_T] <= work[cfg.id_col].map(cutoff)]
+    if work.empty:
+        raise ValueError("no rows remain at or before the as_of cutoff(s)")
+    return work.sort_values([cfg.id_col, _T], kind="mergesort"), cutoff, unit
+
+
+def _split_outcome(
+    work: pd.DataFrame, cfg: FeatureEngineeringConfig,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Tag each row's state and strip the outcome rows out of the feature frame."""
+    id_col = cfg.id_col
+    is_terminal = pd.Series(False, index=work.index)
+    if cfg.terminal_flag_col:
+        if cfg.terminal_flag_col not in work.columns:
+            raise KeyError(f"terminal_flag_col '{cfg.terminal_flag_col}' not found")
+        flag = work[cfg.terminal_flag_col]
+        is_terminal |= flag.notna() & (flag != 0)  # 1 / True / "Y" all count as set
+    if cfg.terminal_event_states and cfg.event_col:
+        is_terminal |= work[cfg.event_col].isin(set(cfg.terminal_event_states))
+
+    if not is_terminal.any():
+        raise ValueError(
+            "the outcome declaration matched no rows at/before the cutoff. Unfixed this would "
+            "count outcome rows as ordinary events and hand the label to n_events and recency, so "
+            "it is an error rather than a no-op. Check that terminal_flag_col is the column set on "
+            f"outcome rows, or that terminal_event_states holds values appearing in {cfg.event_col!r}."
+        )
+
+    # The window should END at the outcome; rows after one mean the cutoff is
+    # past it or the outcome repeats, and either way the label is ambiguous.
+    after = int((is_terminal.groupby(work[id_col]).cumsum() - is_terminal.astype(int) > 0).sum())
+    if after:
+        warnings.warn(f"{after} row(s) fall after an outcome row inside the same entity's window.")
+
+    base = (pd.Series(_OBSERVED, index=work.index, dtype=object) if cfg.event_col is None
+            else work[cfg.event_col].astype(object).fillna(_OBSERVED))
+    work[_STATE] = base.where(~is_terminal, _TERMINAL)
+
+    fit_df, before = work, work[id_col].nunique()
+    work = work[~is_terminal]
+    if work.empty:
+        raise ValueError("every row at/before the cutoff is an outcome row")
+    if before - work[id_col].nunique():
+        warnings.warn(
+            f"{before - work[id_col].nunique()} entity/entities had no history beyond the outcome "
+            "row and are absent from the table. Dropping them changes the population -- handle "
+            "them explicitly rather than letting them vanish."
+        )
+    return fit_df, work
+
+
+def _resolve_roles(
+    work: pd.DataFrame, cfg: FeatureEngineeringConfig, given: Optional[Dict[str, List[str]]],
+) -> Dict[str, List[str]]:
+    if given is None:
+        given = infer_column_roles(
+            work.drop(columns=[c for c in _INTERNAL if c in work.columns]),
+            cfg.id_col, cfg.time_col, max_categories=cfg.max_categories,
+            level_persistence=cfg.level_persistence, sample_rows=cfg.infer_sample_rows,
+            ignore_cols=cfg.ignore_cols,
+        )
+    roles = {k: list(v) for k, v in given.items()}
+    overrides = {"flow": cfg.flow_cols, "level": cfg.level_cols,
+                 "categorical": cfg.categorical_cols, "static": cfg.static_cols}
+    excluded = set(cfg.ignore_cols) | ({cfg.terminal_flag_col} if cfg.terminal_flag_col else set())
+    for role, override in overrides.items():
+        chosen = override if override is not None else roles.get(role, [])
+        roles[role] = [c for c in chosen if c in work.columns and c not in excluded]
+    roles.setdefault("skipped", [])
+    return roles
 
 
 def build_feature_table(
@@ -964,146 +959,51 @@ def build_feature_table(
     ----------
     df : transactional log, one row per (entity, time, ...).
     config : column roles and knobs; only id_col and time_col are required.
-    as_of : point-in-time cutoff. None (default) uses one cutoff for the whole
-        population at the latest timestamp present. Pass a per-entity
-        Series/dict, or a single timestamp, when the table will be joined to a
-        historical outcome -- the cutoff must sit strictly before the outcome is
-        observed.
-    column_roles : skip inference and use these roles (as returned in
-        `artifacts.column_roles`). Pass this when scoring a later batch so the
-        schema cannot drift with the data.
-    hazard : a previously fitted `HazardModel`, used instead of refitting. Only
-        relevant when `terminal_event_states` is configured.
+    as_of : point-in-time cutoff. None uses one cutoff for the whole population
+        at the latest timestamp present. Pass a per-entity Series/dict, or one
+        timestamp, when joining to a historical outcome -- and build it with
+        `matched_cutoffs` if the classes would otherwise be cut differently.
+    column_roles : skip inference and use these (as returned in
+        `artifacts.column_roles`), so a scoring batch cannot drift.
+    hazard : a previously fitted `HazardModel`, used instead of refitting.
     """
-    id_col, time_col = config.id_col, config.time_col
-    for col in (id_col, time_col):
-        if col not in df.columns:
-            raise KeyError(f"column '{col}' not found in input dataframe")
-
-    unit = _detect_time_unit(df[time_col])
-    work = df.copy()
-    work["__t__"] = _to_axis(work[time_col], unit)
-
-    for col in config.zero_is_missing:
-        if col not in work.columns:
-            raise KeyError(f"zero_is_missing names '{col}', which is not in the input dataframe")
-        if not pd.api.types.is_numeric_dtype(work[col]):
-            warnings.warn(f"zero_is_missing names '{col}', which is not numeric; ignoring it")
-            continue
-        work[col] = work[col].replace(0, np.nan)
-
-    unusable = int(work["__t__"].isna().sum())
-    if unusable:
-        warnings.warn(f"dropping {unusable} row(s) with an unparseable or missing {time_col}")
-        work = work[work["__t__"].notna()]
-    if work.empty:
-        raise ValueError("no rows with a usable timestamp")
-
-    declares_outcome = bool(config.terminal_event_states) or bool(config.terminal_flag_col)
-    if config.terminal_event_states and config.event_col is None:
+    cfg = config
+    if cfg.terminal_event_states and cfg.event_col is None:
         raise ValueError(
             "terminal_event_states names values inside event_col, which is not set. Use "
-            "terminal_flag_col instead when the outcome is marked by its own flag column."
+            "terminal_flag_col when the outcome is marked by its own flag column."
         )
-    if declares_outcome and as_of is None:
+    if cfg.declares_outcome and as_of is None:
         raise ValueError(
-            "as_of is required when terminal_event_states is configured: without it the cutoff "
-            "falls after the event for positives and so encodes the label. Pass the per-entity "
-            "decision-time cutoff the label was defined against."
+            "as_of is required when an outcome is declared: without it the cutoff falls after the "
+            "event for positives and so encodes the label. Pass the per-entity decision-time "
+            "cutoff the label was defined against."
         )
 
-    cutoff = _resolve_cutoff(work, id_col, as_of, unit)
-    work = work[work["__t__"] <= work[id_col].map(cutoff)]
-    if work.empty:
-        raise ValueError("no rows remain at or before the as_of cutoff(s)")
-    work = work.sort_values([id_col, "__t__"], kind="mergesort")
-
-    # The hazard is a population object and has to see outcomes, so it is fit
-    # from the pre-strip frame; every feature is read from the stripped one.
+    work, cutoff, unit = _prepare(df, cfg, as_of)
     fit_df = work
-    if declares_outcome:
-        is_terminal = _terminal_mask(work, config)
-        if not is_terminal.any():
-            raise ValueError(
-                "the outcome declaration matched no rows at/before the cutoff. Left unfixed this "
-                "would count outcome rows as ordinary events and hand the label to n_events and "
-                "recency, so it is an error rather than a no-op. Check that terminal_flag_col is "
-                "the column set on outcome rows, or that terminal_event_states holds values that "
-                f"actually appear in {config.event_col!r}."
-            )
+    if cfg.declares_outcome:
+        fit_df, work = _split_outcome(work, cfg)
+        cutoff = cutoff.reindex(pd.Index(work[cfg.id_col].unique(), name=cfg.id_col))
+    work[_CUT] = work[cfg.id_col].map(cutoff)
 
-        # The window is supposed to END at the outcome; anything after one means
-        # either the cutoff is past it or the outcome is not really once-only.
-        after = is_terminal.groupby(work[id_col]).cumsum() - is_terminal.astype(int)
-        if int((after > 0).sum()):
-            warnings.warn(
-                f"{int((after > 0).sum())} row(s) fall after an outcome row inside the same "
-                "entity's window. The window should end at the outcome, so this means the cutoff "
-                "is past it or the outcome repeats -- either way the label is ambiguous."
-            )
+    roles = _resolve_roles(work, cfg, column_roles)
+    masks, window_tags = _subsets(work, cfg)
+    universe = {k: list(v) for k, v in (cfg.category_universe or {}).items()}
 
-        # One state per row for the hazard: the entity's behaviour where known,
-        # a placeholder where not, and the terminal marker on outcome rows.
-        if config.event_col is None:
-            state = pd.Series(_OBSERVED, index=work.index, dtype=object)
-        else:
-            state = work[config.event_col].astype(object).fillna(_OBSERVED)
-        work[_STATE] = state.where(~is_terminal, _TERMINAL)
-
-        fit_df = work
-        before = work[id_col].nunique()
-        work = work[~is_terminal]
-        if work.empty:
-            raise ValueError("every row at/before the cutoff is an outcome row")
-        lost = before - work[id_col].nunique()
-        if lost:
-            warnings.warn(
-                f"{lost} entity/entities had no history other than the outcome row and are "
-                "absent from the table. They are not scoreable, but dropping them changes the "
-                "population -- handle them explicitly rather than letting them vanish."
-            )
-
-    cutoff = cutoff.reindex(pd.Index(work[id_col].unique(), name=id_col))
-    work["__cutoff__"] = work[id_col].map(cutoff)
-
-    if column_roles is None:
-        column_roles = infer_column_roles(
-            work.drop(columns=[c for c in _INTERNAL if c in work.columns]), id_col, time_col,
-            max_categories=config.max_categories, level_autocorr=config.level_autocorr,
-            sample_rows=config.infer_sample_rows, ignore_cols=config.ignore_cols,
-        )
-    roles = {k: list(v) for k, v in column_roles.items()}
-    for role, override in (
-        ("flow", config.flow_cols), ("level", config.level_cols),
-        ("categorical", config.categorical_cols), ("static", config.static_cols),
-    ):
-        if override is not None:
-            roles[role] = [c for c in override if c in work.columns]
-    for role in ("flow", "level", "categorical", "static"):
-        roles[role] = [c for c in roles.get(role, []) if c not in set(config.ignore_cols)]
-    roles.setdefault("skipped", [])
-    if config.terminal_flag_col:  # describes the outcome, never the entity
-        for role in ("flow", "level", "categorical", "static"):
-            roles[role] = [c for c in roles[role] if c != config.terminal_flag_col]
-
-    windows = _window_masks(work, "__cutoff__", "__t__", config.recent_windows)
-    universe: Dict[str, List[Any]] = {k: list(v) for k, v in (config.category_universe or {}).items()}
-
-    layers: Dict[str, pd.DataFrame] = {"activity": _activity_layer(work, config, cutoff, windows)}
+    layers = {"activity": _activity_layer(work, cfg, cutoff, masks, window_tags)}
     index = layers["activity"].index
-    layers["flow"] = _flow_layer(work, config, roles["flow"], windows, index)
-    layers["level"] = _level_layer(work, config, roles["level"], index)
-    layers["categorical"] = _categorical_layer(work, config, roles["categorical"], universe, index)
-    layers["static"] = _static_layer(work, config, roles["static"], universe, index)
-
-    if declares_outcome:
-        layers["hazard"], hazard = _hazard_layer(fit_df, work, config, index, hazard)
+    layers["flow"] = _flow_layer(work, cfg, roles["flow"], masks, index)
+    layers["level"] = _level_layer(work, cfg, roles["level"], index)
+    layers["categorical"] = _categorical_layer(work, cfg, roles["categorical"], universe, index)
+    layers["static"] = _static_layer(work, cfg, roles["static"], universe, index)
+    if cfg.declares_outcome:
+        layers["hazard"], hazard = _hazard_layer(fit_df, work, cfg, index, hazard)
     else:
         hazard = None
 
     table = pd.concat([f for f in layers.values() if not f.empty], axis=1)
-    table.index.name = id_col
-
+    table.index.name = cfg.id_col
     return FeatureEngineeringArtifacts(
         table=table.reset_index(),
         column_roles=roles,
@@ -1119,104 +1019,75 @@ def build_feature_table(
 # --------------------------------------------------------------------------
 
 def _demo_datasets(seed: int = 0) -> Dict[str, Dict[str, Any]]:
-    """Four logs that share nothing but the (entity, time, ...) shape."""
+    """Logs sharing nothing but the (entity, time, ...) shape."""
     rng = np.random.default_rng(seed)
     out: Dict[str, Dict[str, Any]] = {}
 
-    # 1. card payments: amounts and labels, no state column, no outcome
+    def stamps(start: str, n: int, span: int) -> pd.Series:
+        return pd.Timestamp(start) + pd.to_timedelta(rng.integers(0, span, n), "D")
+
     n = 20_000
-    out["card_payments"] = {
-        "df": pd.DataFrame({
-            "account_id": rng.integers(0, 3_000, n),
-            "posted_at": pd.Timestamp("2026-01-01") + pd.to_timedelta(rng.integers(0, 180, n), "D"),
-            "amount": np.round(rng.gamma(2.0, 60.0, n), 2),
-            "merchant_category": rng.choice(["grocery", "fuel", "travel", "dining", "online"], n),
-            "channel": rng.choice(["chip", "online", "contactless"], n),
-        }),
-        "cfg": FeatureEngineeringConfig(id_col="account_id", time_col="posted_at"),
-    }
+    out["card_payments"] = dict(df=pd.DataFrame({
+        "account_id": rng.integers(0, 3_000, n), "posted_at": stamps("2026-01-01", n, 180),
+        "amount": np.round(rng.gamma(2.0, 60.0, n), 2),
+        "merchant_category": rng.choice(["grocery", "fuel", "travel", "dining", "online"], n),
+        "channel": rng.choice(["chip", "online", "contactless"], n),
+    }), cfg=FeatureEngineeringConfig(id_col="account_id", time_col="posted_at",
+                                     recent_windows=(30, 90)))
 
-    # 2. clickstream: mostly categorical, minute-level timestamps
     n = 30_000
-    out["clickstream"] = {
-        "df": pd.DataFrame({
-            "user_id": rng.integers(0, 4_000, n),
-            "ts": pd.Timestamp("2026-03-01") + pd.to_timedelta(rng.integers(0, 43_200, n), "m"),
-            "page": rng.choice(["home", "search", "product", "cart", "checkout", "help"], n),
-            "device": rng.choice(["ios", "android", "web"], n),
-            "dwell_seconds": np.round(rng.exponential(45.0, n), 1),
-        }),
-        "cfg": FeatureEngineeringConfig(id_col="user_id", time_col="ts", recent_windows=(7, 30)),
-    }
+    out["clickstream"] = dict(df=pd.DataFrame({
+        "user_id": rng.integers(0, 4_000, n), "ts": stamps("2026-03-01", n, 30),
+        "page": rng.choice(["home", "search", "product", "cart", "checkout"], n),
+        "device": rng.choice(["ios", "android", "web"], n),
+        "dwell_seconds": np.round(rng.exponential(45.0, n), 1),
+    }), cfg=FeatureEngineeringConfig(id_col="user_id", time_col="ts", recent_windows=(7,)))
 
-    # 3. sensor readings: INTEGER time axis, one true level and one true flow column
-    devices, per_device = 500, 40
-    walk = rng.normal(0, 0.4, (devices, per_device)).cumsum(axis=1)
-    out["sensor_readings"] = {
-        "df": pd.DataFrame({
-            "device_id": np.repeat(np.arange(devices), per_device),
-            "reading_no": np.tile(np.arange(per_device), devices),
-            "temperature_c": np.round((20 + walk).ravel(), 2),                        # persistent
-            "power_draw_wh": np.round(rng.gamma(3.0, 1.5, devices * per_device), 2),  # additive
-            "firmware": np.repeat(rng.choice(["v1", "v2", "v3"], devices), per_device),
-        }),
-        "cfg": FeatureEngineeringConfig(id_col="device_id", time_col="reading_no",
-                                        recent_windows=(5, 20)),
-    }
+    devices, per = 500, 40
+    out["sensor_readings"] = dict(df=pd.DataFrame({  # integer time axis
+        "device_id": np.repeat(np.arange(devices), per), "reading_no": np.tile(np.arange(per), devices),
+        "temperature_c": np.round((20 + rng.normal(0, .4, (devices, per)).cumsum(1)).ravel(), 2),
+        "power_draw_wh": np.round(rng.gamma(3.0, 1.5, devices * per), 2),
+        "firmware": np.repeat(rng.choice(["v1", "v2", "v3"], devices), per),
+    }), cfg=FeatureEngineeringConfig(id_col="device_id", time_col="reading_no"))
 
-    # 4. the NBO case: short histories truncated at a once-only outcome
-    states = ["browse", "offer_view", "offer_click", "service_call", "statement_view"]
-    transition = {
-        "browse": [0.35, 0.30, 0.10, 0.10, 0.15], "offer_view": [0.25, 0.25, 0.30, 0.10, 0.10],
-        "offer_click": [0.20, 0.25, 0.25, 0.15, 0.15], "service_call": [0.30, 0.15, 0.10, 0.30, 0.15],
-        "statement_view": [0.35, 0.20, 0.10, 0.10, 0.25],
-    }
-    true_hazard = {"browse": 0.02, "offer_view": 0.07, "offer_click": 0.22,
-                   "service_call": 0.04, "statement_view": 0.03}
-    rows: List[Dict[str, Any]] = []
-    labels: Dict[int, int] = {}
-    cutoffs: Dict[int, pd.Timestamp] = {}
-    for cust_id in range(4_000):
+    # wealth NBO: multi-year gaps, once-only outcome on its own marker row
+    states = ["browse", "offer_view", "offer_click", "service_call"]
+    trans = {"browse": [.35, .30, .20, .15], "offer_view": [.25, .30, .30, .15],
+             "offer_click": [.20, .25, .35, .20], "service_call": [.35, .20, .15, .30]}
+    true_haz = {"browse": .02, "offer_view": .07, "offer_click": .22, "service_call": .04}
+    rows, labels, cuts = [], {}, {}
+    for cid in range(4_000):
         state = str(rng.choice(states))
-        stamp = pd.Timestamp("2026-01-01") + pd.Timedelta(days=int(rng.integers(0, 120)))
-        balance, label = float(rng.uniform(5_000, 50_000)), 0
-        for _ in range(int(np.clip(rng.geometric(0.22), 1, 20))):
-            balance *= float(rng.uniform(0.95, 1.08))
-            segment = "private" if balance > 30_000 else "retail"
-            rows.append({"customer_id": cust_id, "txn_ts": stamp, "event": state,
-                         "txn_amount": round(float(rng.uniform(10, 2_000)), 2),
-                         "balance": round(balance, 2), "segment": segment,
-                         "outcome_flag": np.nan})
-            stamp += pd.Timedelta(days=float(rng.uniform(1, 40)))
-            if rng.random() < true_hazard[state]:
-                # the outcome row as it actually arrives: an id, a date and a
-                # flag saying WHEN it happened. Every other column is null
-                # because the row does not describe the event, only marks it.
-                rows.append({"customer_id": cust_id, "txn_ts": stamp, "event": None,
-                             "txn_amount": np.nan, "balance": np.nan, "segment": None,
-                             "outcome_flag": 1})
-                label = 1
+        when = pd.Timestamp("2007-01-01") + pd.Timedelta(days=int(rng.integers(0, 4_000)))
+        balance, hit = float(rng.uniform(5_000, 90_000)), 0
+        for _ in range(int(np.clip(rng.geometric(0.28), 1, 20))):
+            balance *= float(rng.uniform(0.96, 1.04))
+            rows.append(dict(customer_id=cid, txn_ts=when, event=state,
+                             txn_amount=round(float(rng.uniform(10, 2_000)), 2),
+                             balance=round(balance, 2), outcome_flag=np.nan))
+            when += pd.Timedelta(days=float(rng.uniform(180, 1_400)))  # years, not days
+            if rng.random() < true_haz[state]:
+                # the outcome row: an id, a date and a flag. Nothing else.
+                rows.append(dict(customer_id=cid, txn_ts=when, event=None, txn_amount=np.nan,
+                                 balance=np.nan, outcome_flag=1))
+                hit = 1
                 break
-            state = str(rng.choice(states, p=transition[state]))
-        labels[cust_id], cutoffs[cust_id] = label, stamp
-
-    out["nbo_events"] = {
-        "df": pd.DataFrame(rows),
-        "cfg": FeatureEngineeringConfig(
-            id_col="customer_id", time_col="txn_ts", event_col="event",
-            terminal_flag_col="outcome_flag", context_orders=(1, 2),
-        ),
-        "as_of": pd.Series(cutoffs),
-        "labels": pd.Series(labels),
-    }
+            state = str(rng.choice(states, p=trans[state]))
+        labels[cid], cuts[cid] = hit, when
+    out["wealth_nbo"] = dict(
+        df=pd.DataFrame(rows), labels=pd.Series(labels), as_of=pd.Series(cuts),
+        cfg=FeatureEngineeringConfig(id_col="customer_id", time_col="txn_ts", event_col="event",
+                                     terminal_flag_col="outcome_flag"),
+    )
     return out
 
 
 def _auc(scores: pd.Series, labels: pd.Series) -> float:
-    """Rank AUC (Mann-Whitney), NaN-tolerant. Used only for the demo leakage check."""
-    frame = pd.DataFrame({"s": np.asarray(scores, dtype=float), "y": np.asarray(labels)}).dropna()
+    """Rank AUC (Mann-Whitney), NaN-tolerant. Demo leakage check only."""
+    frame = pd.DataFrame({"s": np.asarray(scores, float), "y": np.asarray(labels)}).dropna()
     n_pos, n_neg = int((frame.y == 1).sum()), int((frame.y == 0).sum())
-    if n_pos == 0 or n_neg == 0 or frame.s.nunique() < 2:
+    if not n_pos or not n_neg or frame.s.nunique() < 2:
         return float("nan")
     ranks = frame.s.rank()
     return float((ranks[frame.y == 1].sum() - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg))
@@ -1225,29 +1096,29 @@ def _auc(scores: pd.Series, labels: pd.Series) -> float:
 if __name__ == "__main__":
     for name, case in _demo_datasets().items():
         df, cfg = case["df"], case["cfg"]
-        artifacts = build_feature_table(df, cfg, as_of=case.get("as_of"))
-        table = artifacts.table
+        art = build_feature_table(df, cfg, as_of=case.get("as_of"))
+        table, per_id = art.table, df.groupby(cfg.id_col).size()
+        gaps = df.sort_values([cfg.id_col, cfg.time_col]).groupby(cfg.id_col)[cfg.time_col].diff()
+        gap = gaps.dt.days.median() if hasattr(gaps, "dt") else gaps.median()
 
-        per_id = df.groupby(cfg.id_col).size()
         print(f"\n{'=' * 78}")
         print(f"{name}: {len(df):,} rows, {df[cfg.id_col].nunique():,} entities, "
-              f"median {per_id.median():.0f} rows each, time measured in {artifacts.time_unit}s")
-        print("  roles: " + " | ".join(
-            f"{role}={cols}" for role, cols in artifacts.column_roles.items() if cols))
-        print(f"  table {table.shape[0]:,} x {table.shape[1]}  ->  " + ", ".join(
-            f"{layer} {len(cols)}" for layer, cols in artifacts.feature_columns_by_layer.items()))
-        null_rate = table.drop(columns=cfg.id_col).isna().mean()
-        worst = null_rate.sort_values(ascending=False)
-        print(f"  columns over 50% null: {int((null_rate > 0.5).sum())} of {len(null_rate)}"
-              + (f" (worst: {worst.index[0]} {worst.iloc[0]:.0%})" if len(worst) else ""))
+              f"median {per_id.median():.0f} rows each, median gap {gap:,.0f} {art.time_unit}s")
+        print("  roles: " + " | ".join(f"{r}={c}" for r, c in art.column_roles.items() if c))
+        print(f"  table {table.shape[0]:,} x {table.shape[1]}  ->  " +
+              ", ".join(f"{k} {len(v)}" for k, v in art.feature_columns_by_layer.items()))
+        nulls = table.drop(columns=cfg.id_col).isna().mean()
+        dead = [c for c in table.columns if c != cfg.id_col and table[c].nunique(dropna=False) <= 1]
+        print(f"  columns >50% null: {int((nulls > 0.5).sum())} of {len(nulls)} | "
+              f"constant columns: {len(dead)}")
 
         if "labels" in case:
             y = case["labels"].reindex(table[cfg.id_col]).reset_index(drop=True)
-            numeric = [c for c in table.columns
-                       if c != cfg.id_col and pd.api.types.is_numeric_dtype(table[c])]
-            aucs = pd.Series({c: _auc(table[c], y) for c in numeric}).dropna()
+            num = [c for c in table.columns
+                   if c != cfg.id_col and pd.api.types.is_numeric_dtype(table[c])]
+            aucs = pd.Series({c: _auc(table[c], y) for c in num}).dropna()
             top = aucs.sort_values(ascending=False).head(3)
-            print(f"  hazard base rate {artifacts.hazard.base_rate:.3f}, "
-                  f"top AUC: {', '.join(f'{k} {v:.3f}' for k, v in top.items())}")
+            print(f"  hazard base rate {art.hazard.base_rate:.3f} | top AUC: " +
+                  ", ".join(f"{k} {v:.3f}" for k, v in top.items()))
             print(f"  max single-feature AUC {aucs.max():.3f} (>0.99 would mean a leak)")
     print(f"\n{'=' * 78}")

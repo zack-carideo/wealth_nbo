@@ -1,101 +1,90 @@
-"""End-to-end, generalized feature engineering pipeline for a transactional DataFrame.
+"""General-purpose feature engineering for transactional data.
 
-Produces one entity/id-level feature table suitable for variable selection and
-model evaluation, by passing a raw transactional DataFrame through three
-layers, each building on the last:
+Turns any log of the form "one row per (entity, time, ...)" into one row per
+entity, suitable for variable selection and modeling. The only thing the
+input must have is an id column and something that orders events within an
+id. Every other column role is optional and, left unspecified, is inferred
+from the data.
 
-  1. Sequence layer   -- describes where each id currently sits in its own
-                          event sequence, and how likely the terminal event
-                          is from there: current/previous/first state
-                          (schema-stable one-hot), repeat-run length, state
-                          change counts, and a leave-one-out population
-                          hazard -- P(terminal event next | last k states),
-                          with backoff, plus P(terminal event next | number
-                          of prior observations). A low-order Markov model
-                          over the non-terminal states supplies next-state
-                          entropy/concentration when the state column has
-                          enough cardinality for that to mean anything.
-  2. Rollup layer     -- per-id transactional aggregations: activity/timing
-                          (transaction count, inter-event gaps, recency,
-                          distinct products), "flow" aggregates over
-                          transaction-amount-like columns (sum/mean/std +
-                          rolling-window sums), and "level" aggregates over
-                          balance-like columns (last value + rolling-window
-                          delta/pct-change, i.e. generalized "month over
-                          month" style trend, without assuming calendar
-                          cadence).
-  3. Customer layer   -- most-recent-known-value passthrough of configured
-                          static/context columns (e.g. business_type, lob,
-                          current_balance), with schema-stable one-hot
-                          encoding for categoricals.
+    cfg = FeatureEngineeringConfig(id_col="customer_id", time_col="txn_ts")
+    artifacts = build_feature_table(df, cfg)
 
-Data shape this is tuned for
------------------------------
-Short histories -- single-digit observations per id, frequently just one --
-where the modeled outcome is a binary terminal event that occurs AT MOST ONCE
-and ends the observation window. That shape rules out most of what
-long-sequence feature engineering reaches for. Occurrence counts of a
-once-only event are degenerate (0/1, so a count column and its flag are the
-same column). Per-id surprisal or perplexity averaged over one or two
-transitions is sampling noise, not behavior. Order-3 contexts exist for a
-minority of ids, and their availability is a proxy for transaction volume
-rather than a signal in itself.
+That is the whole required contract. Point it at card payments, clickstream,
+sensor readings, claims, or trade tickets and it will produce a sensible
+table without being told what the columns mean.
 
-What survives at this shape is the id's CURRENT state plus a POPULATION
-estimate of what usually follows it: the id supplies the context, the
-population supplies the probability. That is why the hazard features are the
-core of this layer and per-id sequence scoring is not.
+Column roles
+------------
+Roles are inferred by `infer_column_roles` unless you pass them explicitly:
 
-Label leakage -- read this before building a modeling table
-------------------------------------------------------------
-When `terminal_event_states` is configured, presence of the terminal event in
-an id's history IS the label. Three guards follow from that:
+  static       constant within an entity (segment, region, account type) ->
+               carried through as the last known value.
+  flow         numeric and additive; each row is an independent quantity
+               (amount, quantity, duration) -> summed and averaged.
+  level        numeric and persistent; each row is a snapshot that carries
+               over (balance, price, temperature) -> last value and change.
+  categorical  low-cardinality labels (channel, merchant type, page, status)
+               -> distinct count, concentration, current value.
 
-- Terminal-event rows are stripped from every layer before any feature is
-  computed. Left in, they would separate the classes perfectly -- not only
-  through `seq_last_state` but through `n_transactions` and the flow sums.
-- `as_of` becomes required. The default of "each id's own latest observed
-  transaction" is definitionally the event date for positives and the
-  censoring date for negatives, so it encodes the label. Pass the per-id
-  decision-time cutoff that the label was defined against.
-- The `as_of` DISTRIBUTION should match across classes. Positives are cut at
-  their event date; if negatives are all cut at end-of-window, the classes
-  differ by calendar position and any feature with a time trend will look
-  predictive. Sample negatives' cutoffs to mirror the positives' rather than
-  taking end-of-window for all of them. This module cannot detect that for
-  you -- it is a property of how the sample was drawn.
+Flow and level are separated by within-entity lag-1 autocorrelation, which is
+the property that actually distinguishes them: a balance is close to what it
+was last time, a payment amount is not. Inference is a starting point, not an
+oracle -- it is reported in `FeatureEngineeringArtifacts.column_roles`, and
+anything it gets wrong can be pinned in the config.
 
-The population hazard is fit including each id's own outcome, so every per-id
-hazard feature is scored leave-one-out: the id's own at-risk observations and
-events are subtracted from the population counts before the rate is taken.
-Without that subtraction a positive sitting in a rare context reads its own
-outcome back out of the population rate -- leakage concentrated exactly where
-the feature looks most useful.
+Feature families
+----------------
+Every family is deliberately small. On short histories -- and transactional
+data is dominated by entities with a handful of rows -- a wide aggregate
+family is mostly redundant: with three rows the mean and median inter-event
+gap are the same number, the standard deviation is a rescaled absolute
+difference, and a 90-day window contains the entire history. What is kept is
+the subset that stays distinct and defined when an entity has one or two rows.
+
+  activity     n_events, tenure, recency, median/last gap, burstiness, rate,
+               and per-window event counts. Always produced.
+  flow         sum, mean, max, last, plus per-window sum and mean.
+  level        last, min, max, change since previous, change since first.
+  categorical  n_distinct, top-value share, current-value run length, and a
+               schema-stable one-hot of the current value.
+  static       last known value, one-hot encoded if not numeric.
+
+Time
+----
+`time_col` may be datetime-like or numeric. Datetimes are measured in days; a
+numeric column (a sequence number, an epoch, a reading index) is used as-is
+and every window and duration is in those same units. The unit is recorded in
+`artifacts.time_unit`.
 
 Point-in-time correctness
---------------------------
-Every feature in every layer is computed only from transactions at or before
-a per-id `as_of` cutoff (see `build_feature_table`'s `as_of` parameter). With
-no terminal event configured, leaving `as_of=None` defaults every id to its
-own latest observed transaction -- correct for scoring the current population
-"as of now" (e.g. live NBO scoring), though note it makes
-`days_since_last_txn` identically zero. If the table will be evaluated
-against a historical labeled outcome you MUST pass an `as_of` cutoff per id.
+-------------------------
+Features come only from rows at or before an `as_of` cutoff. The default is a
+single cutoff for the whole population at the latest timestamp in the data --
+"score everyone as of now". Note that a PER-ENTITY cutoff of each entity's own
+last row, which looks like the natural default, silently forces recency to
+zero for everyone and so is not offered as one.
 
-Known limitations
-------------------
-- Not vectorized for very large populations (pure-Python loops over
-  sequences, inherited from markov_chain.py); fine at typical customer-level
-  scale.
-- The hazard's leave-one-out correction holds per-id contribution counts in
-  memory (ids x contexts); fine at customer scale, revisit for very large
-  populations or many context orders.
-- One-hot encoding uses a `category_universe` you can pass explicitly and
-  which is also returned in `FeatureEngineeringArtifacts` -- persist and
-  reuse it when scoring new data, otherwise a category present in training
-  but absent from a new batch (or vice versa) will silently shift the
-  encoded schema. Unseen categories collapse into an always-present
-  `__other__` column rather than adding one.
+If the table will be joined to a historical outcome, pass a per-id `as_of`
+strictly before the outcome is observed, or the features will include rows
+from after the thing being predicted.
+
+Optional: terminal-event hazard
+-------------------------------
+One label-aware extra, off unless `terminal_event_states` is set. It suits a
+specific and common setup: an outcome that happens at most once and closes the
+observation window, with history truncated at it. See `_hazard_layer` and
+`_fit_hazard` for what it computes and the two leakage guards it enforces.
+Everything above works without it, and the module has no other notion of a
+label.
+
+Scale
+-----
+The core is vectorized -- groupby aggregations, no per-entity Python loops --
+so it is bounded by pandas rather than by row count. Only the optional hazard
+layer iterates per entity.
+
+Dependencies are numpy and pandas, and nothing else, including nothing else in
+this repository, so the file can be dropped into another project as-is.
 """
 
 from __future__ import annotations
@@ -108,195 +97,445 @@ from typing import Any, Dict, Hashable, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-try:
-    from utils.markov_chain import OrderModel, _build_sequences, fit_markov_chains
-except ImportError:  # running as a script from within utils/ rather than as a package
-    from markov_chain import OrderModel, _build_sequences, fit_markov_chains
-
-State = Hashable
-Context = Tuple[State, ...]
-Counts = Tuple[int, int]  # (n_at_risk, n_events)
-
 __all__ = [
     "FeatureEngineeringConfig",
     "FeatureEngineeringArtifacts",
     "HazardModel",
+    "infer_column_roles",
     "build_feature_table",
 ]
 
+Context = Tuple[Any, ...]
+Counts = Tuple[int, int]  # (n_at_risk, n_events)
+
+_SECONDS_PER_DAY = 86_400.0
+
+
+# --------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------
 
 @dataclass
 class FeatureEngineeringConfig:
-    """Column-role mapping and knobs -- the only thing that changes per dataset."""
+    """Column roles and knobs. Only `id_col` and `time_col` are required.
+
+    Any role left as None is inferred from the data; pass a list (including an
+    empty one) to pin it and skip inference for that role.
+    """
 
     id_col: str
     time_col: str
-    event_col: str  # categorical column driving the sequence/Markov layer
 
-    product_col: Optional[str] = None  # for distinct-product-count features
+    flow_cols: Optional[Sequence[str]] = None
+    level_cols: Optional[Sequence[str]] = None
+    categorical_cols: Optional[Sequence[str]] = None
+    static_cols: Optional[Sequence[str]] = None
+    ignore_cols: Sequence[str] = field(default_factory=tuple)
 
-    flow_cols: Sequence[str] = field(default_factory=tuple)   # transaction amounts: sum/mean/std + rolling sums
-    level_cols: Sequence[str] = field(default_factory=tuple)  # balances/snapshots: last value + rolling delta/pct-change
+    # Windows are in the time column's own units: days for datetimes, raw
+    # units for a numeric time column. Empty disables windowed features.
+    recent_windows: Sequence[float] = (30, 90)
 
-    categorical_passthrough_cols: Sequence[str] = field(default_factory=tuple)  # OHE'd, most-recent value per id
-    numeric_passthrough_cols: Sequence[str] = field(default_factory=tuple)      # as-is, most-recent value per id
+    max_categories: int = 20  # one-hot width cap per column; the rest fold into __other__
+    level_autocorr: float = 0.5  # within-entity lag-1 autocorrelation above which numeric = level
+    infer_sample_rows: int = 200_000  # rows sampled for role inference on large frames
 
-    # -- sequence layer ----------------------------------------------------
-    # States that END the observation window (i.e. the modeled outcome).
-    # Configuring these switches the layer into hazard mode: the rows are
-    # stripped from every layer, `as_of` becomes required, and per-id hazard
-    # features are scored leave-one-out. Leave empty for a descriptive table.
-    terminal_event_states: Sequence[State] = field(default_factory=tuple)
+    category_universe: Optional[Dict[str, List[Any]]] = None  # persist and reuse when scoring
 
-    # Context lengths for the hazard, tried longest-first and backing off to
-    # the next shortest (then to the population base rate) when a context has
-    # too few at-risk observations. Orders past 2 are rarely reachable on
-    # short histories, and their availability tracks volume, not behavior.
+    # -- optional terminal-event hazard; inert unless terminal_event_states is set
+    event_col: Optional[str] = None
+    terminal_event_states: Sequence[Any] = field(default_factory=tuple)
     context_orders: Sequence[int] = (1, 2)
-
-    sequence_max_gap: Optional[pd.Timedelta] = None  # gap starting a new session; None = one session per id
-    sequence_min_support: int = 25  # at-risk observations a context needs before its own rate is used
-    runlen_cap: int = 12  # observation counts at/above this share one hazard bucket
-
-    rolling_windows_days: Sequence[int] = (30, 90)
-
-    category_universe: Optional[Dict[str, Sequence[Any]]] = None  # fixed OHE categories; inferred + returned if omitted
+    hazard_min_support: int = 25
+    runlen_cap: int = 12
 
 
 @dataclass
 class FeatureEngineeringArtifacts:
-    """Everything build_feature_table produces -- not just the table.
+    """The feature table plus everything needed to rebuild it identically.
 
-    Keeping the fitted hazard, Markov models, and category universe around
-    (rather than only returning `table`) is what lets you reuse the exact
-    same population definitions when scoring a new batch later, instead of
-    silently refitting on whatever data happens to be passed in next time.
-    `hazard` in particular should be passed back into `build_feature_table`
-    when scoring: refitting it on a new batch would estimate the outcome rate
-    from the batch being scored.
+    `column_roles`, `category_universe` and `hazard` are the reusable
+    definitions: pass them back in when scoring a later batch so the schema and
+    the population estimates stay fixed, rather than being re-derived from
+    whatever data happens to arrive next.
     """
 
     table: pd.DataFrame
-    markov_models: Dict[int, OrderModel]
-    hazard: Optional["HazardModel"]
+    column_roles: Dict[str, List[str]]
     category_universe: Dict[str, List[Any]]
     feature_columns_by_layer: Dict[str, List[str]]
-
-
-def _validate_config(df: pd.DataFrame, cfg: FeatureEngineeringConfig) -> None:
-    required = [cfg.id_col, cfg.time_col, cfg.event_col]
-    if cfg.product_col:
-        required.append(cfg.product_col)
-    optional_groups = [
-        cfg.flow_cols, cfg.level_cols, cfg.categorical_passthrough_cols, cfg.numeric_passthrough_cols,
-    ]
-    all_cols = required + [c for group in optional_groups for c in group]
-    missing = [c for c in dict.fromkeys(all_cols) if c not in df.columns]
-    if missing:
-        raise KeyError(f"columns not found in input dataframe: {missing}")
-
-
-def _resolve_as_of(
-    df: pd.DataFrame,
-    id_col: str,
-    time_col: str,
-    as_of: Optional[Union[str, pd.Timestamp, pd.Series, Dict[Hashable, Any]]],
-) -> pd.Series:
-    """Per-id cutoff timestamp. None -> each id's own latest observed transaction."""
-    max_ts = df.groupby(id_col)[time_col].max()
-    max_ts.index.name = id_col
-
-    if as_of is None:
-        return max_ts
-
-    if isinstance(as_of, dict):
-        as_of = pd.Series(as_of)
-
-    if isinstance(as_of, pd.Series):
-        cutoff = as_of.reindex(max_ts.index)
-        cutoff.index.name = id_col
-        cutoff = pd.to_datetime(cutoff)
-        missing = cutoff.isna()
-        if missing.any():
-            warnings.warn(
-                f"{int(missing.sum())} id(s) missing an explicit as_of value; "
-                "falling back to their own latest observed transaction."
-            )
-            cutoff = cutoff.fillna(max_ts)
-        return cutoff
-
-    # scalar (str / datetime / Timestamp): same cutoff broadcast to every id
-    cutoff_ts = pd.Timestamp(as_of)
-    return pd.Series(cutoff_ts, index=max_ts.index)
-
-
-def _apply_as_of(
-    df: pd.DataFrame, cfg: FeatureEngineeringConfig, as_of: Any,
-) -> Tuple[pd.DataFrame, pd.Series]:
-    work = df.copy()
-    work[cfg.time_col] = pd.to_datetime(work[cfg.time_col])
-
-    cutoff = _resolve_as_of(work, cfg.id_col, cfg.time_col, as_of)
-    cutoff_df = cutoff.rename("__as_of__").reset_index()
-
-    merged = work.merge(cutoff_df, on=cfg.id_col, how="left")
-    filtered = merged[merged[cfg.time_col] <= merged["__as_of__"]].drop(columns="__as_of__")
-    return filtered.reset_index(drop=True), cutoff
-
-
-def _as_of_last_value(
-    df: pd.DataFrame, id_col: str, time_col: str, value_col: str, cutoff: pd.Series,
-) -> pd.Series:
-    """Each id's most recent non-null value of value_col at/before cutoff[id]. NaN if none exists."""
-    cutoff_df = cutoff.rename("__cutoff__").reset_index()
-    merged = df[[id_col, time_col, value_col]].merge(cutoff_df, on=id_col, how="inner")
-    merged = merged[(merged[time_col] <= merged["__cutoff__"]) & merged[value_col].notna()]
-    merged = merged.sort_values([id_col, time_col], kind="mergesort")
-    last = merged.groupby(id_col, sort=False)[value_col].last()
-    return last.reindex(cutoff.index)
+    time_unit: str
+    hazard: Optional["HazardModel"] = None
 
 
 # --------------------------------------------------------------------------
-# Shared: schema-stable one-hot encoding
+# Time axis
+# --------------------------------------------------------------------------
+
+def _to_axis(values: Any, unit: str) -> pd.Series:
+    """Project timestamps or numbers onto the float axis named by `unit`.
+
+    Days are derived through `total_seconds` rather than by casting to int64
+    and dividing by a nanosecond constant. Since pandas 2.0 a datetime column
+    may be backed by second, millisecond, microsecond or nanosecond
+    resolution, and casting to int64 returns the underlying integer in
+    whichever unit that happens to be -- so the constant is right for one
+    frame and wrong by a factor of a thousand for the next, silently.
+    """
+    series = values if isinstance(values, pd.Series) else pd.Series(values)
+    if unit != "day":
+        return pd.to_numeric(series, errors="coerce").astype(float)
+
+    stamps = pd.to_datetime(series, errors="coerce")
+    if not pd.api.types.is_datetime64_any_dtype(stamps):
+        stamps = pd.to_datetime(series, errors="coerce", utc=True)  # mixed offsets
+    aware = getattr(stamps.dt, "tz", None) is not None
+    epoch = pd.Timestamp("1970-01-01", tz="UTC") if aware else pd.Timestamp("1970-01-01")
+    return (stamps - epoch).dt.total_seconds().where(stamps.notna()) / _SECONDS_PER_DAY
+
+
+def _detect_time_unit(series: pd.Series) -> str:
+    """"day" for anything datetime-like, "unit" for a numeric ordering column.
+
+    A numeric column is taken at face value rather than guessed at: an integer
+    that happens to look like 20260101 is treated as the number it is, and
+    windows are then in those units. Convert it yourself if it means a date.
+    """
+    if pd.api.types.is_numeric_dtype(series):
+        return "unit"
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return "day"
+    if pd.to_datetime(series, errors="coerce").notna().any():
+        return "day"
+    raise TypeError(
+        f"time column is neither numeric nor parseable as datetime (dtype {series.dtype}); "
+        "convert it to timestamps or to a numeric sequence order first"
+    )
+
+
+# --------------------------------------------------------------------------
+# Column role inference
+# --------------------------------------------------------------------------
+
+def infer_column_roles(
+    df: pd.DataFrame,
+    id_col: str,
+    time_col: str,
+    max_categories: int = 20,
+    level_autocorr: float = 0.5,
+    sample_rows: int = 200_000,
+    ignore_cols: Sequence[str] = (),
+) -> Dict[str, List[str]]:
+    """Classify every remaining column as static, flow, level, categorical or skipped.
+
+    The one non-obvious test is flow vs. level. Both are numeric, so dtype
+    cannot separate them, and column names cannot be relied on across datasets.
+    What does separate them is persistence: a balance, a price or a temperature
+    is close to its own previous value within the same entity, while an amount
+    or a quantity is not. So the rule is the pooled within-entity lag-1
+    autocorrelation, computed on entity-mean-centered values so that
+    differences BETWEEN entities cannot masquerade as persistence.
+
+    Columns constant within an entity are static regardless of dtype, and
+    non-numeric columns with too many distinct values are skipped rather than
+    encoded -- free text or an identifier would otherwise produce a feature per
+    value.
+    """
+    reserved = {id_col, time_col, *ignore_cols}
+    candidates = [c for c in df.columns if c not in reserved]
+    roles: Dict[str, List[str]] = {
+        "static": [], "flow": [], "level": [], "categorical": [], "skipped": [],
+    }
+    if not candidates:
+        return roles
+
+    sample = df
+    if len(df) > sample_rows:  # sample whole entities, never rows within one
+        ids = df[id_col].drop_duplicates()
+        keep = ids.sample(n=max(1, int(len(ids) * sample_rows / len(df))), random_state=0)
+        sample = df[df[id_col].isin(set(keep))]
+
+    sample = sample.sort_values([id_col, time_col], kind="mergesort")
+    grouped = sample.groupby(id_col, sort=False)
+
+    for col in candidates:
+        series = sample[col]
+        if series.notna().sum() == 0 or series.nunique(dropna=True) <= 1:
+            roles["skipped"].append(col)  # nothing to learn from a constant
+            continue
+
+        # constant within entity -> a property of the entity, not of its activity
+        if float(grouped[col].nunique(dropna=True).le(1).mean()) >= 0.95:
+            roles["static"].append(col)
+            continue
+
+        if pd.api.types.is_numeric_dtype(series):
+            centered = series.astype(float) - grouped[col].transform("mean").astype(float)
+            lagged = centered.groupby(sample[id_col], sort=False).shift(1)
+            usable = centered.notna() & lagged.notna()
+            if usable.sum() >= 30 and centered[usable].std() > 0 and lagged[usable].std() > 0:
+                persistence = float(np.corrcoef(centered[usable], lagged[usable])[0, 1])
+            else:
+                persistence = 0.0  # too little within-entity history to tell; treat as flow
+            roles["level" if persistence >= level_autocorr else "flow"].append(col)
+            continue
+
+        if pd.api.types.is_datetime64_any_dtype(series):
+            roles["skipped"].append(col)  # a second time column needs a role you choose
+            continue
+
+        if series.nunique(dropna=True) <= max(max_categories * 5, 100):
+            roles["categorical"].append(col)
+        else:
+            roles["skipped"].append(col)
+
+    return roles
+
+
+# --------------------------------------------------------------------------
+# Shared helpers
 # --------------------------------------------------------------------------
 
 def _one_hot(values: pd.Series, prefix: str, universe: Sequence[Any]) -> pd.DataFrame:
     """One column per `universe` entry, in order, plus an always-present `__other__`.
 
-    Keeping `__other__` even when nothing lands in it is deliberate: the
-    encoded schema then depends only on `universe`, so a training table and a
-    scoring table built from the same universe have identical columns whether
-    or not the new batch happens to contain an unseen category. NaN encodes as
-    all zeros -- pair it with an explicit availability flag wherever the
-    difference between "absent" and "none of the above" matters.
+    `__other__` is emitted even when empty so the schema depends only on the
+    universe: a training table and a scoring table built from the same universe
+    have identical columns whether or not the new batch contains an unseen
+    value. NaN encodes as all zeros.
     """
-    cols = list(universe) + ["__other__"]
+    columns = list(universe) + ["__other__"]
     known = values.where(values.isin(universe) | values.isna(), other="__other__")
     return pd.DataFrame(
-        {f"{prefix}_{cat}": (known == cat).astype(int) for cat in cols},
+        {f"{prefix}_{cat}": (known == cat).astype("int8") for cat in columns},
         index=values.index,
     )
 
 
+def _universe_for(
+    values: pd.Series, col: str, universe: Dict[str, List[Any]], max_categories: int,
+) -> List[Any]:
+    """Fixed category list for `col`, keeping the most frequent when capped."""
+    if col in universe:
+        return universe[col]
+    counts = values.value_counts()
+    chosen = sorted(counts.index[:max_categories].tolist(), key=str)
+    universe[col] = chosen
+    return chosen
+
+
+def _positional(work: pd.DataFrame, id_col: str, cols: Sequence[str]) -> Dict[str, pd.DataFrame]:
+    """First / previous / last non-null value per entity, for several columns.
+
+    Rows must already be sorted by (id, time). Nulls are dropped per column,
+    which is why this is not one groupby over all of them: the last KNOWN
+    balance is rarely the balance on the entity's last row.
+    """
+    out: Dict[str, pd.DataFrame] = {}
+    for col in cols:
+        valid = work.loc[work[col].notna(), [id_col, col]]
+        grouped = valid.groupby(id_col, sort=False)[col]
+
+        # `prev` via tail(2) rather than nth(-2): as of pandas 2.0 nth returns
+        # rows on the ORIGINAL index instead of one value per group, which
+        # silently misaligns when reindexed by entity. tail(2).first() is the
+        # second-to-last value, masked off where the entity has only one row.
+        tail = valid.groupby(id_col, sort=False).tail(2).groupby(id_col, sort=False)[col]
+        out[col] = pd.DataFrame({
+            "first": grouped.first(),
+            "last": grouped.last(),
+            "prev": tail.first().where(tail.size() == 2),
+        })
+    return out
+
+
+def _window_masks(
+    work: pd.DataFrame, cutoff_col: str, time_col: str, windows: Sequence[float],
+) -> Dict[float, pd.Series]:
+    return {
+        float(w): (work[time_col] > work[cutoff_col] - float(w)) & (work[time_col] <= work[cutoff_col])
+        for w in windows
+    }
+
+
 # --------------------------------------------------------------------------
-# Layer 1: sequence position + terminal-event hazard
+# Layers
+# --------------------------------------------------------------------------
+
+def _activity_layer(
+    work: pd.DataFrame, cfg: FeatureEngineeringConfig, cutoff: pd.Series,
+    windows: Dict[float, pd.Series],
+) -> pd.DataFrame:
+    """Recency, frequency, tenure and rhythm -- the one family every log supports."""
+    id_col = cfg.id_col
+    grouped = work.groupby(id_col, sort=False)["__t__"]
+
+    out = pd.DataFrame({"n_events": grouped.size(), "__first": grouped.min(), "__last": grouped.max()})
+    out["tenure"] = out["__last"] - out["__first"]
+    out["recency"] = cutoff.reindex(out.index) - out["__last"]
+
+    by_id = work["__t__"].groupby(work[id_col], sort=False).diff().groupby(work[id_col], sort=False)
+    out["gap_median"] = by_id.median()
+    out["gap_last"] = by_id.last()
+    # >1 means the entity's latest gap is longer than its own norm: cooling off.
+    # Scale-free, so it compares entities with very different natural rhythms.
+    out["gap_burstiness"] = out["gap_last"] / out["gap_median"].replace(0, np.nan)
+    out["events_per_unit"] = out["n_events"] / out["tenure"].replace(0, np.nan)
+
+    for window, mask in windows.items():
+        counts = work.loc[mask].groupby(id_col, sort=False).size()
+        out[f"n_events_w{window:g}"] = counts.reindex(out.index).fillna(0).astype(int)
+
+    return out.drop(columns=["__first", "__last"])
+
+
+def _flow_layer(
+    work: pd.DataFrame, cfg: FeatureEngineeringConfig, cols: Sequence[str],
+    windows: Dict[float, pd.Series], index: pd.Index,
+) -> pd.DataFrame:
+    """Additive quantities: how much in total, how much typically, how much lately."""
+    if not cols:
+        return pd.DataFrame(index=index)
+
+    cols = list(cols)
+    overall = work.groupby(cfg.id_col, sort=False)[cols].agg(["sum", "mean", "max"])
+    overall.columns = [f"{col}_{stat}" for col, stat in overall.columns]
+    frames = [overall]
+
+    positions = _positional(work, cfg.id_col, cols)
+    frames.append(pd.DataFrame({f"{col}_last": positions[col]["last"] for col in cols}))
+
+    for window, mask in windows.items():
+        windowed = work.loc[mask].groupby(cfg.id_col, sort=False)[cols].agg(["sum", "mean"])
+        windowed.columns = [f"{col}_{stat}_w{window:g}" for col, stat in windowed.columns]
+        frames.append(windowed)
+
+    out = pd.concat([f.reindex(index) for f in frames], axis=1)
+    # a window the entity was present for but inactive in truly moved zero
+    sums = [c for c in out.columns if "_sum" in c]
+    out[sums] = out[sums].fillna(0.0)
+    return out
+
+
+def _level_layer(
+    work: pd.DataFrame, cfg: FeatureEngineeringConfig, cols: Sequence[str], index: pd.Index,
+) -> pd.DataFrame:
+    """Snapshots: where the entity stands now, and how it got there.
+
+    Change is measured against the entity's own previous and first observations
+    rather than a calendar window. That keeps it defined on short histories and
+    free of any assumption about cadence -- a window-based delta is null for
+    every entity whose history is shorter than the window, which on
+    transactional data is most of them.
+    """
+    if not cols:
+        return pd.DataFrame(index=index)
+
+    cols = list(cols)
+    out = work.groupby(cfg.id_col, sort=False)[cols].agg(["min", "max"])
+    out.columns = [f"{col}_{stat}" for col, stat in out.columns]
+
+    positions = _positional(work, cfg.id_col, cols)
+    for col in cols:
+        pos = positions[col].reindex(out.index)
+        out[f"{col}_last"] = pos["last"]
+        out[f"{col}_delta_last"] = pos["last"] - pos["prev"]
+        out[f"{col}_delta_total"] = pos["last"] - pos["first"]
+        out[f"{col}_pct_change_total"] = (
+            out[f"{col}_delta_total"] / pos["first"].replace(0, np.nan)
+        ).replace([np.inf, -np.inf], np.nan)
+
+    return out.reindex(index)
+
+
+def _categorical_layer(
+    work: pd.DataFrame, cfg: FeatureEngineeringConfig, cols: Sequence[str],
+    universe: Dict[str, List[Any]], index: pd.Index,
+) -> pd.DataFrame:
+    """Variety, concentration and current value of each label column.
+
+    Concentration is a top-value share rather than a raw distinct count because
+    distinct counts are bounded by the number of rows, which makes them largely
+    a restatement of n_events on short histories.
+    """
+    if not cols:
+        return pd.DataFrame(index=index)
+
+    id_col = cfg.id_col
+    frames: List[pd.DataFrame] = []
+    encoded: List[str] = []
+
+    for col in cols:
+        valid = work.loc[work[col].notna(), [id_col, col]]
+        by_entity = valid.groupby([id_col, col], sort=False).size().groupby(level=0)
+
+        stats = pd.DataFrame({
+            f"{col}_n_distinct": by_entity.size(),
+            f"{col}_top_share": by_entity.max() / by_entity.sum().replace(0, np.nan),
+        })
+
+        # how many consecutive rows the entity has now spent on its current value
+        current = valid[col]
+        by_id = valid.groupby(id_col, sort=False)
+        changed = (current != by_id[col].shift()).astype(int)
+        run_id = changed.groupby(valid[id_col], sort=False).cumsum()
+        in_last_run = run_id == run_id.groupby(valid[id_col], sort=False).transform("max")
+        stats[f"{col}_run_len"] = in_last_run.groupby(valid[id_col], sort=False).sum()
+
+        last_value = by_id[col].last()
+        one_hot = _one_hot(last_value, f"{col}_last", _universe_for(
+            last_value, col, universe, cfg.max_categories))
+        encoded.extend(one_hot.columns)
+        frames.append(pd.concat([stats, one_hot], axis=1))
+
+    out = pd.concat([f.reindex(index) for f in frames], axis=1)
+    out[encoded] = out[encoded].fillna(0).astype("int8")
+    return out
+
+
+def _static_layer(
+    work: pd.DataFrame, cfg: FeatureEngineeringConfig, cols: Sequence[str],
+    universe: Dict[str, List[Any]], index: pd.Index,
+) -> pd.DataFrame:
+    """Last known value of each entity-level attribute; one-hot if not numeric."""
+    if not cols:
+        return pd.DataFrame(index=index)
+
+    positions = _positional(work, cfg.id_col, cols)
+    frames: List[pd.DataFrame] = []
+    encoded: List[str] = []
+    for col in cols:
+        last_value = positions[col]["last"]
+        if pd.api.types.is_numeric_dtype(work[col]):
+            frames.append(last_value.rename(col).to_frame())
+        else:
+            one_hot = _one_hot(last_value, col, _universe_for(
+                last_value, col, universe, cfg.max_categories))
+            encoded.extend(one_hot.columns)
+            frames.append(one_hot)
+
+    out = pd.concat([f.reindex(index) for f in frames], axis=1)
+    out[encoded] = out[encoded].fillna(0).astype("int8")
+    return out
+
+
+# --------------------------------------------------------------------------
+# Optional layer: terminal-event hazard
 # --------------------------------------------------------------------------
 
 @dataclass
 class HazardModel:
-    """Population discrete-time hazard of the terminal event.
+    """Population discrete-time hazard of a once-only terminal event.
 
-    `by_order[k][context]` and `by_runlen[n]` hold (n_at_risk, n_events) for
-    every context observed in the population. The parallel `own_*` maps hold
-    each id's own contribution to those same cells, which is what lets a
-    per-id feature be scored leave-one-out. That subtraction is not a nicety:
-    the hazard is fit on data that includes each id's own outcome, so a
-    positive sitting in a thinly-populated context would otherwise read its
-    own label back out of the population rate.
+    `by_order[k][context]` and `by_runlen[n]` hold (n_at_risk, n_events). The
+    parallel `own_*` maps hold each entity's own contribution to those cells,
+    which is what lets a per-entity feature be read leave-one-out. That
+    subtraction is not cosmetic: the hazard is fit on data containing each
+    entity's own outcome, so a positive sitting in a thinly-populated context
+    would otherwise read its own label back out of the population rate.
 
-    Keep this alongside the feature table and reuse it when scoring a later
-    batch. Ids absent from `own_*` (i.e. anyone not in the fitting population)
-    simply subtract nothing, which is the correct behavior for new entities.
+    Reuse this when scoring a later batch. Entities absent from `own_*`
+    subtract nothing, which is correct for ones the model has not seen.
     """
 
     base: Counts
@@ -313,7 +552,7 @@ class HazardModel:
         return e / n if n else float("nan")
 
     def to_frame(self) -> pd.DataFrame:
-        """Long-format view of the fitted hazard, for inspection/sanity checks."""
+        """Long-format view of the fitted rates, for inspection."""
         rows: List[Dict[str, Any]] = []
         for n_obs, (n, e) in sorted(self.by_runlen.items()):
             rows.append({"kind": "runlen", "context": n_obs,
@@ -324,90 +563,78 @@ class HazardModel:
                              "n_at_risk": n, "n_events": e, "rate": e / n if n else np.nan})
         if not rows:
             return pd.DataFrame(columns=["kind", "context", "n_at_risk", "n_events", "rate"])
-        return (
-            pd.DataFrame(rows)
-            .sort_values(["kind", "n_at_risk"], ascending=[True, False])
-            .reset_index(drop=True)
-        )
+        return (pd.DataFrame(rows)
+                .sort_values(["kind", "n_at_risk"], ascending=[True, False])
+                .reset_index(drop=True))
 
 
-def _freeze(counter: Dict[Any, List[int]]) -> Dict[Any, Counts]:
-    return {key: (val[0], val[1]) for key, val in counter.items()}
+def _sequences(df: pd.DataFrame, id_col: str, value_col: str) -> Dict[Hashable, List[Any]]:
+    """Each entity's states, oldest first, nulls dropped. Rows must be sorted."""
+    valid = df.loc[df[value_col].notna(), [id_col, value_col]]
+    return {id_: list(states) for id_, states in valid.groupby(id_col, sort=False)[value_col]}
 
 
 def _fit_hazard(
-    sequences: List[Any], terminal: set, orders: Sequence[int], runlen_cap: int,
+    sequences: Dict[Hashable, List[Any]], terminal: set, orders: Sequence[int], runlen_cap: int,
 ) -> HazardModel:
-    """Count at-risk observations and terminal events per context, and per id.
+    """Person-period expansion: one at-risk row per observation before the event.
 
-    This is the standard person-period expansion: every observation before the
-    terminal event is one at-risk row, carrying a 1 if the terminal event
-    followed it and a 0 otherwise. An id that never reached the event
-    contributes all of its observations as zeros -- including its last one,
-    which is a known non-event rather than a censored row, because the
-    observation window runs past it (that is what makes the id a negative).
+    Each row carries a 1 if the terminal event followed it and a 0 otherwise. An
+    entity that never reached the event contributes all of its observations as
+    zeros, INCLUDING its last one -- that is a known non-event rather than a
+    censored row, because the observation window runs past it, which is what
+    makes the entity a negative.
 
-    Dropping that final observation instead would remove only zeros, and only
-    from the ids that never converted, biasing every rate upward by roughly
-    one over the mean history length. On single-digit histories that is not a
-    rounding error: it inflated the strongest context by ~40% in testing.
+    Dropping that final observation would remove only zeros, and only from the
+    entities that never converted, biasing every rate upward by roughly one over
+    the mean history length. On short histories that is not a rounding error: it
+    inflated the strongest context by ~40% in testing.
 
-    The one case where these rows really are censored is a history truncated
-    by the data pull rather than by the label window. Then the last row's
-    outcome is genuinely unknown and counting it as a zero is optimistic --
-    cut such ids out of the fitting population, or fit the hazard on an
-    earlier window and pass it in prefit.
+    The exception is a history truncated by the data pull rather than by the
+    label window, where the last row's outcome is genuinely unknown and counting
+    it as a zero is optimistic. Exclude such entities from the fitting
+    population, or fit on an earlier window and pass the model in prefit.
     """
     base = [0, 0]
     own_base: Dict[Hashable, List[int]] = defaultdict(lambda: [0, 0])
     by_runlen: Dict[int, List[int]] = defaultdict(lambda: [0, 0])
     own_by_runlen: Dict[Tuple[Hashable, int], List[int]] = defaultdict(lambda: [0, 0])
-    by_order: Dict[int, Dict[Context, List[int]]] = {
-        k: defaultdict(lambda: [0, 0]) for k in orders
-    }
-    own_by_order: Dict[int, Dict[Tuple[Hashable, Context], List[int]]] = {
-        k: defaultdict(lambda: [0, 0]) for k in orders
-    }
+    by_order = {k: defaultdict(lambda: [0, 0]) for k in orders}
+    own_by_order = {k: defaultdict(lambda: [0, 0]) for k in orders}
 
-    for seq in sequences:
-        states = seq.states
-        for i in range(len(states)):
-            if states[i] in terminal:
+    for id_, states in sequences.items():
+        for i, state in enumerate(states):
+            if state in terminal:
                 break  # the window ended here; nothing after it is at risk
             event = 1 if i + 1 < len(states) and states[i + 1] in terminal else 0
 
-            base[0] += 1
-            base[1] += event
-            own = own_base[seq.id_]
-            own[0] += 1
-            own[1] += event
+            for cell in (base, own_base[id_]):
+                cell[0] += 1
+                cell[1] += event
 
-            bucket = min(i + 1, runlen_cap)  # observations seen so far, capped
-            cell = by_runlen[bucket]
-            cell[0] += 1
-            cell[1] += event
-            own_cell = own_by_runlen[(seq.id_, bucket)]
-            own_cell[0] += 1
-            own_cell[1] += event
+            bucket = min(i + 1, runlen_cap)
+            for cell in (by_runlen[bucket], own_by_runlen[(id_, bucket)]):
+                cell[0] += 1
+                cell[1] += event
 
             for order in orders:
                 if i + 1 < order:
                     continue
                 ctx = tuple(states[i - order + 1 : i + 1])
-                cell = by_order[order][ctx]
-                cell[0] += 1
-                cell[1] += event
-                own_cell = own_by_order[order][(seq.id_, ctx)]
-                own_cell[0] += 1
-                own_cell[1] += event
+                for cell in (by_order[order][ctx], own_by_order[order][(id_, ctx)]):
+                    cell[0] += 1
+                    cell[1] += event
+
+    def freeze(counter: Dict[Any, List[int]]) -> Dict[Any, Counts]:
+        return {key: (val[0], val[1]) for key, val in counter.items()}
 
     return HazardModel(
         base=(base[0], base[1]),
-        by_order={k: _freeze(v) for k, v in by_order.items()},
-        by_runlen=_freeze(by_runlen),
-        own_base=_freeze(own_base),
-        own_by_order={k: _freeze(v) for k, v in own_by_order.items()},
-        own_by_runlen=_freeze(own_by_runlen),
+        by_order={k: freeze(v) for k, v in by_order.items()},
+        by_runlen=freeze(by_runlen),
+        own_base=freeze(own_base),
+        own_by_order={k: freeze(v) for k, v in own_by_order.items()},
+        own_by_runlen=freeze(own_by_runlen),
         runlen_cap=runlen_cap,
     )
 
@@ -415,8 +642,8 @@ def _fit_hazard(
 def _loo_rate(total: Optional[Counts], own: Counts, min_support: int) -> Optional[float]:
     """Population rate for one context with `own`'s contribution removed.
 
-    None means the context is too thin to trust once the id's own rows are
-    taken out -- the caller should back off to a shorter context.
+    None means the context is too thin to trust once the entity's own rows are
+    taken out, and the caller should back off to a shorter context.
     """
     if total is None:
         return None
@@ -427,538 +654,354 @@ def _loo_rate(total: Optional[Counts], own: Counts, min_support: int) -> Optiona
     return n_events / n_at_risk
 
 
-def _sequence_layer(
-    full_df: pd.DataFrame,
-    work_df: pd.DataFrame,
-    cfg: FeatureEngineeringConfig,
-    state_universe: Optional[Sequence[Any]],
-    prefit_hazard: Optional[HazardModel] = None,
-) -> Tuple[pd.DataFrame, Dict[int, OrderModel], Optional[HazardModel], List[Any]]:
-    """Where each id currently sits, and how likely the terminal event is from there.
+def _hazard_layer(
+    fit_df: pd.DataFrame, work: pd.DataFrame, cfg: FeatureEngineeringConfig,
+    index: pd.Index, prefit: Optional[HazardModel],
+) -> Tuple[pd.DataFrame, Optional[HazardModel]]:
+    """How likely the terminal event is from where each entity currently stands.
 
-    `full_df` still contains the terminal-event rows and is used ONLY to fit
-    the population hazard. `work_df` has them stripped and is the only frame
-    any per-id feature is read from -- see the module docstring on leakage.
+    `fit_df` still contains the terminal-event rows and is used only to fit the
+    population hazard. `work` has them stripped and is the only frame any
+    per-entity feature is read from.
     """
-    id_col, time_col, event_col = cfg.id_col, cfg.time_col, cfg.event_col
-    all_ids = work_df[[id_col]].drop_duplicates().reset_index(drop=True)
+    id_col, event_col = cfg.id_col, cfg.event_col
     terminal = set(cfg.terminal_event_states)
     orders = sorted({int(k) for k in cfg.context_orders if int(k) >= 1}, reverse=True)
 
-    hazard: Optional[HazardModel] = prefit_hazard
-    if hazard is None and terminal and orders:
-        fit_seqs = _build_sequences(
-            full_df, id_col, time_col, event_col,
-            cfg.sequence_max_gap, collapse_repeats=False, min_length=1,
-        )
-        if fit_seqs:
-            hazard = _fit_hazard(fit_seqs, terminal, orders, cfg.runlen_cap)
-        else:
-            warnings.warn("no id had any usable history; hazard features skipped")
-
-    # min_length=1 (not the default 2): an id with a single observation still
-    # has a current state, and at this data shape that is a large share of the
-    # population -- the default would drop them from the layer entirely.
-    obs_seqs = _build_sequences(
-        work_df, id_col, time_col, event_col,
-        cfg.sequence_max_gap, collapse_repeats=False, min_length=1,
-    )
-    latest: Dict[Hashable, Any] = {}
-    for seq in obs_seqs:
-        current = latest.get(seq.id_)
-        if current is None or seq.timestamps[-1] > current.timestamps[-1]:
-            latest[seq.id_] = seq
-
-    if state_universe is None:
-        state_universe = sorted(work_df[event_col].dropna().unique().tolist(), key=str)
-
-    models: Dict[int, OrderModel] = {}
-    n_distinct = int(work_df[event_col].nunique(dropna=True))
-    if n_distinct < 2:
-        warnings.warn(
-            f"'{event_col}' has {n_distinct} distinct non-terminal state(s), so the next-state "
-            "distribution is constant and those features were skipped -- the hazard and "
-            "run-length features carry the sequence signal at this cardinality."
-        )
-    else:
-        try:
-            models = fit_markov_chains(
-                work_df, id_col, time_col, event_col,
-                orders=sorted(orders), max_gap=cfg.sequence_max_gap,
-                collapse_repeats=False, min_support=cfg.sequence_min_support,
-            )
-        except ValueError as exc:
-            warnings.warn(f"next-state distribution features skipped: {exc}")
+    hazard = prefit
+    if hazard is None:
+        fit_seqs = _sequences(fit_df.sort_values([id_col, "__t__"], kind="mergesort"),
+                              id_col, event_col)
+        if not fit_seqs:
+            warnings.warn("no usable history; hazard features skipped")
+            return pd.DataFrame(index=index), None
+        hazard = _fit_hazard(fit_seqs, terminal, orders, cfg.runlen_cap)
 
     rows: List[Dict[str, Any]] = []
-    for id_, seq in latest.items():
-        states, times = seq.states, seq.timestamps
+    for id_, states in _sequences(work, id_col, event_col).items():
         n_obs = len(states)
+        base_rate = _loo_rate(hazard.base, hazard.own_base.get(id_, (0, 0)), 1)
+        if base_rate is None:
+            base_rate = hazard.base_rate
 
-        run = 1  # how long the id has been sitting in its current state
-        while run < n_obs and states[-1 - run] == states[-1]:
-            run += 1
+        bucket = min(n_obs, hazard.runlen_cap)
+        by_runlen = _loo_rate(
+            hazard.by_runlen.get(bucket), hazard.own_by_runlen.get((id_, bucket), (0, 0)),
+            cfg.hazard_min_support,
+        )
 
-        row: Dict[str, Any] = {
+        context_rate, context_order = None, 0
+        for order in orders:  # longest context first, backing off when too thin
+            if n_obs < order:
+                continue
+            ctx = tuple(states[-order:])
+            rate = _loo_rate(
+                hazard.by_order[order].get(ctx),
+                hazard.own_by_order[order].get((id_, ctx), (0, 0)),
+                cfg.hazard_min_support,
+            )
+            if rate is not None:
+                context_rate, context_order = rate, order
+                break
+        if context_rate is None:
+            context_rate = base_rate
+
+        rows.append({
             id_col: id_,
-            "seq_n_distinct_states": len(set(states)),
-            "seq_n_state_changes": sum(1 for a, b in zip(states, states[1:]) if a != b),
-            "seq_repeat_run_len": run,
-            "seq_days_in_last_state": (times[-1] - times[n_obs - run]).total_seconds() / 86400.0,
-            "__last": states[-1],
-            "__prev": states[-2] if n_obs >= 2 else np.nan,
-            "__first": states[0],
-        }
-
-        if hazard is not None:
-            base_rate = _loo_rate(hazard.base, hazard.own_base.get(id_, (0, 0)), 1)
-            if base_rate is None:
-                base_rate = hazard.base_rate
-
-            bucket = min(n_obs, hazard.runlen_cap)
-            by_runlen = _loo_rate(
-                hazard.by_runlen.get(bucket),
-                hazard.own_by_runlen.get((id_, bucket), (0, 0)),
-                cfg.sequence_min_support,
-            )
-            row["seq_hazard_runlen"] = base_rate if by_runlen is None else by_runlen
-
-            ctx_rate: Optional[float] = None
-            ctx_order = 0
-            for order in orders:  # longest context first, backing off when too thin
-                if n_obs < order:
-                    continue
-                ctx = tuple(states[-order:])
-                rate = _loo_rate(
-                    hazard.by_order[order].get(ctx),
-                    hazard.own_by_order[order].get((id_, ctx), (0, 0)),
-                    cfg.sequence_min_support,
-                )
-                if rate is not None:
-                    ctx_rate, ctx_order = rate, order
-                    break
-            row["seq_hazard_context"] = base_rate if ctx_rate is None else ctx_rate
-            row["seq_hazard_context_order"] = ctx_order  # 0 = fell back to the base rate
-            row["seq_hazard_lift"] = (
-                row["seq_hazard_context"] / base_rate if base_rate else np.nan
-            )
-
-        for order in orders:  # same backoff for the next-state distribution
-            model = models.get(order)
-            if model is None or n_obs < order:
-                continue
-            dist = model.probs.get(tuple(states[-order:]))
-            if not dist:
-                continue
-            row["seq_next_state_entropy_bits"] = model.entropy.get(tuple(states[-order:]), np.nan)
-            row["seq_top_next_state_prob"] = max(dist.values())
-            row["seq_next_state_order"] = order
-            break
-
-        rows.append(row)
+            "hazard_runlen": base_rate if by_runlen is None else by_runlen,
+            "hazard_context": context_rate,
+            "hazard_context_order": context_order,  # 0 = fell back to the base rate
+            "hazard_lift": context_rate / base_rate if base_rate else np.nan,
+        })
 
     if not rows:
-        return all_ids, models, hazard, list(state_universe)
-
-    feats = pd.DataFrame(rows)
-    feats["seq_has_prev_state"] = feats["__prev"].notna().astype(int)
-    for prefix, src in (
-        ("seq_last_state", "__last"), ("seq_prev_state", "__prev"), ("seq_first_state", "__first"),
-    ):
-        feats = pd.concat([feats, _one_hot(feats[src], prefix, state_universe)], axis=1)
-    feats = feats.drop(columns=["__last", "__prev", "__first"])
-
-    return all_ids.merge(feats, on=id_col, how="left"), models, hazard, list(state_universe)
-
-
-# --------------------------------------------------------------------------
-# Layer 2: transactional rollups
-# --------------------------------------------------------------------------
-
-def _rollup_activity_features(
-    work_df: pd.DataFrame, cfg: FeatureEngineeringConfig, cutoff: pd.Series,
-) -> pd.DataFrame:
-    id_col, time_col = cfg.id_col, cfg.time_col
-
-    out = work_df.groupby(id_col)[time_col].agg(
-        n_transactions="count", first_txn_ts="min", last_txn_ts="max",
-    ).reset_index()
-
-    if cfg.product_col:
-        nprod = work_df.groupby(id_col)[cfg.product_col].nunique().rename("n_distinct_products").reset_index()
-        out = out.merge(nprod, on=id_col, how="left")
-
-    sorted_df = work_df.sort_values([id_col, time_col], kind="mergesort").copy()
-    sorted_df["__gap_days__"] = sorted_df.groupby(id_col)[time_col].diff().dt.total_seconds() / 86400.0
-    gap_stats = sorted_df.groupby(id_col)["__gap_days__"].agg(
-        avg_days_between_txn="mean", median_days_between_txn="median", std_days_between_txn="std",
-    ).reset_index()
-    out = out.merge(gap_stats, on=id_col, how="left")
-
-    cutoff_df = cutoff.rename("__as_of__").reset_index()
-    out = out.merge(cutoff_df, on=id_col, how="left")
-    out["tenure_days"] = (out["last_txn_ts"] - out["first_txn_ts"]).dt.total_seconds() / 86400.0
-    out["days_since_last_txn"] = (out["__as_of__"] - out["last_txn_ts"]).dt.total_seconds() / 86400.0
-    out = out.drop(columns="__as_of__")
-
-    return out
-
-
-def _rollup_flow_features(
-    work_df: pd.DataFrame, cfg: FeatureEngineeringConfig, cutoff: pd.Series,
-) -> pd.DataFrame:
-    id_col, time_col = cfg.id_col, cfg.time_col
-    out = work_df[[id_col]].drop_duplicates().reset_index(drop=True)
-    if not cfg.flow_cols:
-        return out
-
-    cutoff_df = cutoff.rename("__as_of__").reset_index()
-    merged = work_df.merge(cutoff_df, on=id_col, how="left")
-
-    new_zero_cols: List[str] = []
-    for col in cfg.flow_cols:
-        agg = work_df.groupby(id_col)[col].agg(
-            **{f"{col}_sum": "sum", f"{col}_mean": "mean", f"{col}_std": "std",
-               f"{col}_min": "min", f"{col}_max": "max"},
-        ).reset_index()
-        out = out.merge(agg, on=id_col, how="left")
-        new_zero_cols.append(f"{col}_sum")
-
-        for window in cfg.rolling_windows_days:
-            lower = merged["__as_of__"] - pd.Timedelta(days=window)
-            windowed = merged[(merged[time_col] > lower) & (merged[time_col] <= merged["__as_of__"])]
-            wagg = windowed.groupby(id_col)[col].agg(
-                **{f"{col}_sum_{window}d": "sum", f"{col}_count_{window}d": "count"},
-            ).reset_index()
-            out = out.merge(wagg, on=id_col, how="left")
-            new_zero_cols.extend([f"{col}_sum_{window}d", f"{col}_count_{window}d"])
-
-    # a window with zero qualifying transactions truly moved zero dollars/events -- 0, not missing
-    out[new_zero_cols] = out[new_zero_cols].fillna(0.0)
-    return out
-
-
-def _rollup_level_features(
-    work_df: pd.DataFrame, cfg: FeatureEngineeringConfig, cutoff: pd.Series,
-) -> pd.DataFrame:
-    id_col = cfg.id_col
-    out = work_df[[id_col]].drop_duplicates().reset_index(drop=True)
-    if not cfg.level_cols:
-        return out
-
-    for col in cfg.level_cols:
-        end_val = _as_of_last_value(work_df, id_col, cfg.time_col, col, cutoff)
-        stats = work_df.groupby(id_col)[col].agg(
-            **{f"{col}_min": "min", f"{col}_max": "max", f"{col}_std": "std"},
-        ).reset_index()
-        stats[f"{col}_last"] = stats[id_col].map(end_val)
-        out = out.merge(stats, on=id_col, how="left")
-
-        for window in cfg.rolling_windows_days:
-            window_cutoff = cutoff - pd.Timedelta(days=window)
-            start_val = _as_of_last_value(work_df, id_col, cfg.time_col, col, window_cutoff)
-            delta = end_val - start_val
-            pct = (delta / start_val.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
-
-            window_df = pd.DataFrame({
-                id_col: cutoff.index,
-                f"{col}_delta_{window}d": delta.to_numpy(),
-                f"{col}_pct_change_{window}d": pct.to_numpy(),
-            })
-            out = out.merge(window_df, on=id_col, how="left")
-
-    return out
-
-
-# --------------------------------------------------------------------------
-# Layer 3: customer-level passthrough + one-hot encoding
-# --------------------------------------------------------------------------
-
-def _customer_layer(
-    work_df: pd.DataFrame, cfg: FeatureEngineeringConfig, cutoff: pd.Series,
-) -> Tuple[pd.DataFrame, Dict[str, List[Any]]]:
-    id_col = cfg.id_col
-    out = work_df[[id_col]].drop_duplicates().reset_index(drop=True)
-    category_universe: Dict[str, List[Any]] = dict(cfg.category_universe or {})
-
-    for col in cfg.numeric_passthrough_cols:
-        vals = _as_of_last_value(work_df, id_col, cfg.time_col, col, cutoff)
-        out[col] = out[id_col].map(vals)
-
-    for col in cfg.categorical_passthrough_cols:
-        vals = _as_of_last_value(work_df, id_col, cfg.time_col, col, cutoff)
-
-        universe = category_universe.get(col)
-        if universe is None:
-            universe = sorted(vals.dropna().unique().tolist(), key=str)
-            category_universe[col] = universe
-
-        dummies = _one_hot(vals, col, universe)
-        dummies = dummies.reset_index().rename(columns={dummies.index.name or "index": id_col})
-        out = out.merge(dummies, on=id_col, how="left")
-        ohe_cols = [c for c in dummies.columns if c != id_col]
-        out[ohe_cols] = out[ohe_cols].fillna(0).astype(int)
-
-    return out, category_universe
+        return pd.DataFrame(index=index), hazard
+    return pd.DataFrame(rows).set_index(id_col).reindex(index), hazard
 
 
 # --------------------------------------------------------------------------
 # Orchestration
 # --------------------------------------------------------------------------
-# Orchestration
-# --------------------------------------------------------------------------
+
+def _resolve_cutoff(work: pd.DataFrame, id_col: str, as_of: Any, unit: str) -> pd.Series:
+    """Per-entity cutoff on the float time axis.
+
+    None means one cutoff for the whole population at the latest timestamp in
+    the data. The alternative that looks natural -- each entity's own last row
+    -- makes `recency` identically zero for everyone, so it is not a default.
+    """
+    ids = pd.Index(work[id_col].unique(), name=id_col)
+    if as_of is None:
+        return pd.Series(float(work["__t__"].max()), index=ids)
+
+    if isinstance(as_of, dict):
+        as_of = pd.Series(as_of)
+    if isinstance(as_of, pd.Series):
+        cutoff = _to_axis(as_of, unit)
+        cutoff.index = as_of.index
+        cutoff = cutoff.reindex(ids)
+        missing = cutoff.isna()
+        if missing.any():
+            warnings.warn(
+                f"{int(missing.sum())} entity/entities have no as_of value; falling back to the "
+                "population maximum. Pass a cutoff for every entity to avoid mixing cutoffs."
+            )
+            cutoff = cutoff.fillna(float(work["__t__"].max()))
+        cutoff.index.name = id_col
+        return cutoff
+
+    return pd.Series(float(_to_axis([as_of], unit).iloc[0]), index=ids)
+
 
 def build_feature_table(
     df: pd.DataFrame,
     config: FeatureEngineeringConfig,
-    as_of: Optional[Union[str, pd.Timestamp, pd.Series, Dict[Hashable, Any]]] = None,
+    as_of: Optional[Union[str, float, pd.Timestamp, pd.Series, Dict[Hashable, Any]]] = None,
+    column_roles: Optional[Dict[str, List[str]]] = None,
     hazard: Optional[HazardModel] = None,
 ) -> FeatureEngineeringArtifacts:
-    """Run the full sequence -> rollup -> customer pipeline and return the merged feature table.
+    """Build one row of features per entity.
 
     Parameters
     ----------
-    df : raw transactional DataFrame, one row per (id, timestamp, event/...).
-    config : column-role mapping and knobs, see FeatureEngineeringConfig.
-    as_of : point-in-time cutoff -- a per-id Series/dict, or one global
-        timestamp. REQUIRED when `config.terminal_event_states` is set,
-        because the default ("each id's own latest observed transaction") is
-        the event date for positives and the censoring date for negatives,
-        which encodes the label. Pass the decision-time cutoff the label was
-        defined against, and check that its distribution matches across
-        classes -- see the module docstring.
-    hazard : a `HazardModel` fit previously. Pass this when scoring a new
-        batch, or when the design calls for fitting the hazard on a strictly
-        earlier training window; omitted, it is fit from `df` itself.
+    df : transactional log, one row per (entity, time, ...).
+    config : column roles and knobs; only id_col and time_col are required.
+    as_of : point-in-time cutoff. None (default) uses one cutoff for the whole
+        population at the latest timestamp present. Pass a per-entity
+        Series/dict, or a single timestamp, when the table will be joined to a
+        historical outcome -- the cutoff must sit strictly before the outcome is
+        observed.
+    column_roles : skip inference and use these roles (as returned in
+        `artifacts.column_roles`). Pass this when scoring a later batch so the
+        schema cannot drift with the data.
+    hazard : a previously fitted `HazardModel`, used instead of refitting. Only
+        relevant when `terminal_event_states` is configured.
     """
-    _validate_config(df, config)
-    id_col, time_col, event_col = config.id_col, config.time_col, config.event_col
-    terminal = set(config.terminal_event_states)
+    id_col, time_col = config.id_col, config.time_col
+    for col in (id_col, time_col):
+        if col not in df.columns:
+            raise KeyError(f"column '{col}' not found in input dataframe")
 
+    unit = _detect_time_unit(df[time_col])
+    work = df.copy()
+    work["__t__"] = _to_axis(work[time_col], unit)
+
+    unusable = int(work["__t__"].isna().sum())
+    if unusable:
+        warnings.warn(f"dropping {unusable} row(s) with an unparseable or missing {time_col}")
+        work = work[work["__t__"].notna()]
+    if work.empty:
+        raise ValueError("no rows with a usable timestamp")
+
+    terminal = set(config.terminal_event_states)
+    if terminal and config.event_col is None:
+        raise ValueError("terminal_event_states requires event_col to be set")
     if terminal and as_of is None:
         raise ValueError(
-            "as_of is required when terminal_event_states is configured: defaulting each id to "
-            "its own latest transaction makes the cutoff the event date for positives and the "
-            "censoring date for negatives, which encodes the label. Pass the per-id "
+            "as_of is required when terminal_event_states is configured: without it the cutoff "
+            "falls after the event for positives and so encodes the label. Pass the per-entity "
             "decision-time cutoff the label was defined against."
         )
 
-    work_df, cutoff = _apply_as_of(df, config, as_of)
-    if work_df.empty:
-        raise ValueError("no transactions remain at/before the given as_of cutoff(s)")
+    cutoff = _resolve_cutoff(work, id_col, as_of, unit)
+    work = work[work["__t__"] <= work[id_col].map(cutoff)]
+    if work.empty:
+        raise ValueError("no rows remain at or before the as_of cutoff(s)")
+    work = work.sort_values([id_col, "__t__"], kind="mergesort")
 
-    # The hazard is a POPULATION object and has to see outcomes, so it is fit
-    # from the unfiltered history rather than from the per-id feature window.
-    # Each id's own contribution is subtracted when the feature is read back
-    # (see HazardModel); pass a prefit `hazard` when the design needs the
-    # population estimated on a strictly earlier window instead.
-    hazard_df = df.copy()
-    hazard_df[time_col] = pd.to_datetime(hazard_df[time_col])
+    # The hazard is a population object and has to see outcomes, so it is fit
+    # from the pre-strip frame; every feature is read from the stripped one.
+    fit_df = work
+    if terminal:
+        before = work[id_col].nunique()
+        work = work[~work[config.event_col].isin(terminal)]
+        if work.empty:
+            raise ValueError("every row at/before the cutoff is a terminal event")
+        lost = before - work[id_col].nunique()
+        if lost:
+            warnings.warn(
+                f"{lost} entity/entities had no history other than the terminal event and are "
+                "absent from the table. They are not scoreable, but dropping them changes the "
+                "population -- handle them explicitly rather than letting them vanish."
+            )
+
+    cutoff = cutoff.reindex(pd.Index(work[id_col].unique(), name=id_col))
+    work["__cutoff__"] = work[id_col].map(cutoff)
+
+    if column_roles is None:
+        column_roles = infer_column_roles(
+            work.drop(columns=["__t__", "__cutoff__"]), id_col, time_col,
+            max_categories=config.max_categories, level_autocorr=config.level_autocorr,
+            sample_rows=config.infer_sample_rows, ignore_cols=config.ignore_cols,
+        )
+    roles = {k: list(v) for k, v in column_roles.items()}
+    for role, override in (
+        ("flow", config.flow_cols), ("level", config.level_cols),
+        ("categorical", config.categorical_cols), ("static", config.static_cols),
+    ):
+        if override is not None:
+            roles[role] = [c for c in override if c in work.columns]
+    for role in ("flow", "level", "categorical", "static"):
+        roles[role] = [c for c in roles.get(role, []) if c not in set(config.ignore_cols)]
+    roles.setdefault("skipped", [])
+
+    windows = _window_masks(work, "__cutoff__", "__t__", config.recent_windows)
+    universe: Dict[str, List[Any]] = {k: list(v) for k, v in (config.category_universe or {}).items()}
+
+    layers: Dict[str, pd.DataFrame] = {"activity": _activity_layer(work, config, cutoff, windows)}
+    index = layers["activity"].index
+    layers["flow"] = _flow_layer(work, config, roles["flow"], windows, index)
+    layers["level"] = _level_layer(work, config, roles["level"], index)
+    layers["categorical"] = _categorical_layer(work, config, roles["categorical"], universe, index)
+    layers["static"] = _static_layer(work, config, roles["static"], universe, index)
 
     if terminal:
-        ordered = work_df.sort_values([id_col, time_col], kind="mergesort")
-        is_terminal = ordered[event_col].isin(terminal)
-        n_after = int(
-            (is_terminal.groupby(ordered[id_col]).cumsum() - is_terminal.astype(int) > 0).sum()
-        )
-        if n_after:
-            warnings.warn(
-                f"{n_after} row(s) fall after a terminal event inside the same id's window. The "
-                "window is supposed to END at the event, so this means either the cutoff is past "
-                "it or the event is not actually once-only -- both make the label ambiguous."
-            )
+        layers["hazard"], hazard = _hazard_layer(fit_df, work, config, index, hazard)
+    else:
+        hazard = None
 
-        before_ids = work_df[id_col].nunique()
-        work_df = work_df[~work_df[event_col].isin(terminal)].reset_index(drop=True)
-        if work_df.empty:
-            raise ValueError(
-                "every row at/before the cutoff is a terminal event; nothing to build features from"
-            )
-        dropped = before_ids - work_df[id_col].nunique()
-        if dropped:
-            warnings.warn(
-                f"{dropped} id(s) had no history other than the terminal event and are absent "
-                "from the feature table. They are not scoreable here, but dropping them changes "
-                "the population -- handle them explicitly rather than letting them vanish."
-            )
-        cutoff = cutoff[cutoff.index.isin(set(work_df[id_col].unique()))]
-
-    state_universe = (config.category_universe or {}).get(event_col)
-    seq_feats, markov_models, hazard, state_universe = _sequence_layer(
-        hazard_df, work_df, config, state_universe, prefit_hazard=hazard,
-    )
-    activity_feats = _rollup_activity_features(work_df, config, cutoff)
-    flow_feats = _rollup_flow_features(work_df, config, cutoff)
-    level_feats = _rollup_level_features(work_df, config, cutoff)
-    cust_feats, category_universe = _customer_layer(work_df, config, cutoff)
-    category_universe.setdefault(event_col, list(state_universe))
-
-    table = activity_feats
-    for frame in (flow_feats, level_feats, seq_feats, cust_feats):
-        table = table.merge(frame, on=id_col, how="left")
-
-    feature_columns_by_layer = {
-        "activity": [c for c in activity_feats.columns if c != id_col],
-        "flow": [c for c in flow_feats.columns if c != id_col],
-        "level": [c for c in level_feats.columns if c != id_col],
-        "sequence": [c for c in seq_feats.columns if c != id_col],
-        "customer": [c for c in cust_feats.columns if c != id_col],
-    }
+    table = pd.concat([f for f in layers.values() if not f.empty], axis=1)
+    table.index.name = id_col
 
     return FeatureEngineeringArtifacts(
-        table=table,
-        markov_models=markov_models,
+        table=table.reset_index(),
+        column_roles=roles,
+        category_universe=universe,
+        feature_columns_by_layer={k: list(v.columns) for k, v in layers.items() if not v.empty},
+        time_unit=unit,
         hazard=hazard,
-        category_universe=category_universe,
-        feature_columns_by_layer=feature_columns_by_layer,
     )
 
 
-def _make_dummy_transactions(
-    n_ids: int = 4_000, seed: int = 0,
-) -> Tuple[pd.DataFrame, pd.Series, pd.Series]:
-    """Synthetic log matching the shape this module targets.
+# --------------------------------------------------------------------------
+# Demo: four unrelated transactional shapes
+# --------------------------------------------------------------------------
 
-    Each id accumulates behavioral observations until it either hits the
-    terminal event ("purchase", at most once, closing the window) or its
-    window closes without one. History length is 1-20 observations with a
-    median near 3, and the true hazard depends on the current state -- an
-    offer_click is roughly ten times likelier to be followed by a purchase
-    than a browse -- so there is a real signal for the layer to recover.
-
-    Returns the transaction log, the binary label, and the per-id as_of
-    cutoff. Negatives' cutoffs come from the same waiting-time process as the
-    positives' event dates rather than a common end-of-window, so the two
-    classes are not separated by calendar position alone.
-    """
+def _demo_datasets(seed: int = 0) -> Dict[str, Dict[str, Any]]:
+    """Four logs that share nothing but the (entity, time, ...) shape."""
     rng = np.random.default_rng(seed)
+    out: Dict[str, Dict[str, Any]] = {}
+
+    # 1. card payments: amounts and labels, no state column, no outcome
+    n = 20_000
+    out["card_payments"] = {
+        "df": pd.DataFrame({
+            "account_id": rng.integers(0, 3_000, n),
+            "posted_at": pd.Timestamp("2026-01-01") + pd.to_timedelta(rng.integers(0, 180, n), "D"),
+            "amount": np.round(rng.gamma(2.0, 60.0, n), 2),
+            "merchant_category": rng.choice(["grocery", "fuel", "travel", "dining", "online"], n),
+            "channel": rng.choice(["chip", "online", "contactless"], n),
+        }),
+        "cfg": FeatureEngineeringConfig(id_col="account_id", time_col="posted_at"),
+    }
+
+    # 2. clickstream: mostly categorical, minute-level timestamps
+    n = 30_000
+    out["clickstream"] = {
+        "df": pd.DataFrame({
+            "user_id": rng.integers(0, 4_000, n),
+            "ts": pd.Timestamp("2026-03-01") + pd.to_timedelta(rng.integers(0, 43_200, n), "m"),
+            "page": rng.choice(["home", "search", "product", "cart", "checkout", "help"], n),
+            "device": rng.choice(["ios", "android", "web"], n),
+            "dwell_seconds": np.round(rng.exponential(45.0, n), 1),
+        }),
+        "cfg": FeatureEngineeringConfig(id_col="user_id", time_col="ts", recent_windows=(7, 30)),
+    }
+
+    # 3. sensor readings: INTEGER time axis, one true level and one true flow column
+    devices, per_device = 500, 40
+    walk = rng.normal(0, 0.4, (devices, per_device)).cumsum(axis=1)
+    out["sensor_readings"] = {
+        "df": pd.DataFrame({
+            "device_id": np.repeat(np.arange(devices), per_device),
+            "reading_no": np.tile(np.arange(per_device), devices),
+            "temperature_c": np.round((20 + walk).ravel(), 2),                        # persistent
+            "power_draw_wh": np.round(rng.gamma(3.0, 1.5, devices * per_device), 2),  # additive
+            "firmware": np.repeat(rng.choice(["v1", "v2", "v3"], devices), per_device),
+        }),
+        "cfg": FeatureEngineeringConfig(id_col="device_id", time_col="reading_no",
+                                        recent_windows=(5, 20)),
+    }
+
+    # 4. the NBO case: short histories truncated at a once-only outcome
     states = ["browse", "offer_view", "offer_click", "service_call", "statement_view"]
     transition = {
-        "browse":         [0.35, 0.30, 0.10, 0.10, 0.15],
-        "offer_view":     [0.25, 0.25, 0.30, 0.10, 0.10],
-        "offer_click":    [0.20, 0.25, 0.25, 0.15, 0.15],
-        "service_call":   [0.30, 0.15, 0.10, 0.30, 0.15],
+        "browse": [0.35, 0.30, 0.10, 0.10, 0.15], "offer_view": [0.25, 0.25, 0.30, 0.10, 0.10],
+        "offer_click": [0.20, 0.25, 0.25, 0.15, 0.15], "service_call": [0.30, 0.15, 0.10, 0.30, 0.15],
         "statement_view": [0.35, 0.20, 0.10, 0.10, 0.25],
     }
-    true_hazard = {  # P(terminal event next | current state)
-        "browse": 0.02, "offer_view": 0.07, "offer_click": 0.22,
-        "service_call": 0.04, "statement_view": 0.03,
-    }
-    products = ["brokerage", "retirement", "insurance", "trust"]
-    business_types = ["retail", "commercial", "private_bank"]
-    lobs = ["wealth", "consumer"]
-
+    true_hazard = {"browse": 0.02, "offer_view": 0.07, "offer_click": 0.22,
+                   "service_call": 0.04, "statement_view": 0.03}
     rows: List[Dict[str, Any]] = []
     labels: Dict[int, int] = {}
     cutoffs: Dict[int, pd.Timestamp] = {}
-    base_day = pd.Timestamp("2026-01-01")
-
-    for cust_id in range(n_ids):
-        max_obs = int(np.clip(rng.geometric(0.22), 1, 20))
-        stamp = base_day + pd.Timedelta(days=int(rng.integers(0, 120)))
+    for cust_id in range(4_000):
         state = str(rng.choice(states))
-        balance = float(rng.uniform(5_000, 50_000))
-        business_type = str(rng.choice(business_types))
-        lob = str(rng.choice(lobs))
-        label = 0
-
-        def emit(event: str, when: pd.Timestamp) -> None:
-            rows.append({
-                "customer_id": cust_id,
-                "txn_ts": when,
-                "event": event,
-                "product": str(rng.choice(products)),
-                "txn_amount": round(float(rng.uniform(10, 2_000)), 2),
-                "balance": round(balance, 2),
-                "business_type": business_type,
-                "lob": lob,
-            })
-
-        for _ in range(max_obs):
+        stamp = pd.Timestamp("2026-01-01") + pd.Timedelta(days=int(rng.integers(0, 120)))
+        balance, label = float(rng.uniform(5_000, 50_000)), 0
+        for _ in range(int(np.clip(rng.geometric(0.22), 1, 20))):
             balance *= float(rng.uniform(0.95, 1.08))
-            emit(state, stamp)
-            stamp = stamp + pd.Timedelta(days=float(rng.uniform(1, 40)))
+            segment = "private" if balance > 30_000 else "retail"
+            rows.append({"customer_id": cust_id, "txn_ts": stamp, "event": state,
+                         "txn_amount": round(float(rng.uniform(10, 2_000)), 2),
+                         "balance": round(balance, 2), "segment": segment})
+            stamp += pd.Timedelta(days=float(rng.uniform(1, 40)))
             if rng.random() < true_hazard[state]:
-                emit("purchase", stamp)
+                rows.append({"customer_id": cust_id, "txn_ts": stamp, "event": "purchase",
+                             "txn_amount": 0.0, "balance": round(balance, 2), "segment": segment})
                 label = 1
                 break
             state = str(rng.choice(states, p=transition[state]))
+        labels[cust_id], cutoffs[cust_id] = label, stamp
 
-        labels[cust_id] = label
-        # positives: the event date. negatives: where the next observation
-        # would have landed -- same waiting-time process, so the cutoff
-        # distribution does not itself separate the classes.
-        cutoffs[cust_id] = stamp
-
-    label_series = pd.Series(labels, name="label")
-    label_series.index.name = "customer_id"
-    cutoff_series = pd.Series(cutoffs, name="as_of")
-    cutoff_series.index.name = "customer_id"
-    return pd.DataFrame(rows), label_series, cutoff_series
+    out["nbo_events"] = {
+        "df": pd.DataFrame(rows),
+        "cfg": FeatureEngineeringConfig(
+            id_col="customer_id", time_col="txn_ts", event_col="event",
+            terminal_event_states=("purchase",), context_orders=(1, 2),
+        ),
+        "as_of": pd.Series(cutoffs),
+        "labels": pd.Series(labels),
+    }
+    return out
 
 
 def _auc(scores: pd.Series, labels: pd.Series) -> float:
-    """Rank AUC (Mann-Whitney), NaN-tolerant -- used only for the demo's leakage check."""
-    frame = pd.DataFrame({"s": scores, "y": labels}).dropna()
-    n_pos = int((frame["y"] == 1).sum())
-    n_neg = int((frame["y"] == 0).sum())
-    if n_pos == 0 or n_neg == 0 or frame["s"].nunique() < 2:
+    """Rank AUC (Mann-Whitney), NaN-tolerant. Used only for the demo leakage check."""
+    frame = pd.DataFrame({"s": np.asarray(scores, dtype=float), "y": np.asarray(labels)}).dropna()
+    n_pos, n_neg = int((frame.y == 1).sum()), int((frame.y == 0).sum())
+    if n_pos == 0 or n_neg == 0 or frame.s.nunique() < 2:
         return float("nan")
-    ranks = frame["s"].rank()
-    return float((ranks[frame["y"] == 1].sum() - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg))
+    ranks = frame.s.rank()
+    return float((ranks[frame.y == 1].sum() - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg))
 
 
 if __name__ == "__main__":
-    transactions, labels, as_of = _make_dummy_transactions(n_ids=4_000, seed=0)
-    observed = transactions[transactions["event"] != "purchase"]
-    per_id = observed.groupby("customer_id").size()
-    print(f"dummy log: {len(transactions)} rows, {transactions['customer_id'].nunique()} customers")
-    print(f"pre-event observations per id: median {per_id.median():.0f}, "
-          f"min {per_id.min()}, max {per_id.max()}, event rate {labels.mean():.1%}\n")
+    for name, case in _demo_datasets().items():
+        df, cfg = case["df"], case["cfg"]
+        artifacts = build_feature_table(df, cfg, as_of=case.get("as_of"))
+        table = artifacts.table
 
-    cfg = FeatureEngineeringConfig(
-        id_col="customer_id",
-        time_col="txn_ts",
-        event_col="event",
-        product_col="product",
-        flow_cols=["txn_amount"],
-        level_cols=["balance"],
-        categorical_passthrough_cols=["business_type", "lob"],
-        numeric_passthrough_cols=["balance"],
-        terminal_event_states=("purchase",),
-        context_orders=(1, 2),
-        sequence_min_support=25,
-        rolling_windows_days=(30, 90),
-    )
+        per_id = df.groupby(cfg.id_col).size()
+        print(f"\n{'=' * 78}")
+        print(f"{name}: {len(df):,} rows, {df[cfg.id_col].nunique():,} entities, "
+              f"median {per_id.median():.0f} rows each, time measured in {artifacts.time_unit}s")
+        print("  roles: " + " | ".join(
+            f"{role}={cols}" for role, cols in artifacts.column_roles.items() if cols))
+        print(f"  table {table.shape[0]:,} x {table.shape[1]}  ->  " + ", ".join(
+            f"{layer} {len(cols)}" for layer, cols in artifacts.feature_columns_by_layer.items()))
+        null_rate = table.drop(columns=cfg.id_col).isna().mean()
+        worst = null_rate.sort_values(ascending=False)
+        print(f"  columns over 50% null: {int((null_rate > 0.5).sum())} of {len(null_rate)}"
+              + (f" (worst: {worst.index[0]} {worst.iloc[0]:.0%})" if len(worst) else ""))
 
-    artifacts = build_feature_table(transactions, cfg, as_of=as_of)
-    table = artifacts.table
-
-    print(f"feature table shape: {table.shape}")
-    print("columns by layer:")
-    for layer, cols in artifacts.feature_columns_by_layer.items():
-        print(f"  {layer}: {len(cols)} columns")
-
-    print("\nfitted hazard (base rate "
-          f"{artifacts.hazard.base_rate:.3f}) vs the rates the data was generated from:")
-    truth = {"browse": 0.02, "offer_view": 0.07, "offer_click": 0.22,
-             "service_call": 0.04, "statement_view": 0.03}
-    fitted = artifacts.hazard.to_frame()
-    order1 = fitted[fitted["kind"] == "order1"].copy()
-    order1["true_rate"] = order1["context"].map(truth)
-    print(order1.to_string(index=False))
-
-    y = labels.reindex(table["customer_id"]).to_numpy()
-    print("\nsingle-feature rank AUC vs label (>0.99 would mean a leak):")
-    aucs = {
-        col: _auc(table[col], pd.Series(y))
-        for col in table.columns
-        if col != "customer_id" and pd.api.types.is_numeric_dtype(table[col])
-    }
-    ranked = pd.Series(aucs).dropna().sort_values(ascending=False)
-    print(ranked.head(8).round(3).to_string())
-    print(f"  ... max over all {len(ranked)} numeric features: {ranked.max():.3f}")
-
-    print("\nsequence-layer coverage (pct non-null):")
-    seq_cols = [c for c in artifacts.feature_columns_by_layer["sequence"] if not c.startswith("seq_last_state_")]
-    print((table[seq_cols].notna().mean() * 100).round(1).sort_values().head(8).to_string())
+        if "labels" in case:
+            y = case["labels"].reindex(table[cfg.id_col]).reset_index(drop=True)
+            numeric = [c for c in table.columns
+                       if c != cfg.id_col and pd.api.types.is_numeric_dtype(table[c])]
+            aucs = pd.Series({c: _auc(table[c], y) for c in numeric}).dropna()
+            top = aucs.sort_values(ascending=False).head(3)
+            print(f"  hazard base rate {artifacts.hazard.base_rate:.3f}, "
+                  f"top AUC: {', '.join(f'{k} {v:.3f}' for k, v in top.items())}")
+            print(f"  max single-feature AUC {aucs.max():.3f} (>0.99 would mean a leak)")
+    print(f"\n{'=' * 78}")

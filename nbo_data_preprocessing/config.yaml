@@ -1,0 +1,121 @@
+# =====================================================================
+# Cross-sell preprocessing config
+#
+# EVERY input to preprocess.py lives here. The script contains no
+# column names, no dates, no thresholds. To point the pipeline at a new
+# dataset with different features, edit this file only.
+# =====================================================================
+
+io:
+  input_path:   "/mnt/user-data/outputs/sample_raw_acquisitions.csv"
+  output_dir:   "/mnt/user-data/outputs/model_data"
+  artifact_dir: "/mnt/user-data/outputs/artifacts"
+
+# ---------------------------------------------------------------------
+# Which column plays which role. These are the only names the script
+# needs to know about; everything else is discovered from the lists
+# further down.
+# ---------------------------------------------------------------------
+columns:
+  id:           "customer_id"
+  date:         "origination_date"
+  target:       "target"          # non-null ONLY on outcome rows
+  product_type: "product_type"
+  # Optional secondary sort key to break same-day ties. Set to null if
+  # none exists; ties then fall back to input file order (stable sort).
+  tiebreak:     null
+
+# ---------------------------------------------------------------------
+# product_type -> family rollup. Types absent from this map fall into
+# the family named by `default_family`. Keep this small: family count
+# drives the width of the count/one-hot blocks downstream.
+# ---------------------------------------------------------------------
+product_families:
+  default_family: "OTHER"
+  map:
+    checking_basic:        "TXN_DEPOSIT"
+    checking_premium:      "TXN_DEPOSIT"
+    savings_standard:      "SAV_TIME"
+    cd_standard:           "SAV_TIME"
+    jumbo_cd:              "SAV_TIME"
+    money_market:          "SAV_TIME"
+    credit_card_rewards:   "CARD"
+    credit_card_cashback:  "CARD"
+    credit_card_secured:   "CARD"
+    auto_loan:             "SEC_INSTALL"
+    mortgage_fixed:        "MORTGAGE"
+    heloc:                 "MORTGAGE"
+
+# ---------------------------------------------------------------------
+# Numeric columns and how to aggregate them over full history.
+#
+#   aggregations:      any of sum / max / mean / count_nonnull
+#   log1p:             emit log1p(value) alongside the raw aggregate
+#   percentile_group:  ordered fallback list of grouping keys used to
+#                      rank this column. Special key "year" means the
+#                      calendar year of the acquisition date. Set to
+#                      null to skip percentile encoding for this column.
+# ---------------------------------------------------------------------
+numeric_columns:
+  deposit_balance:
+    aggregations: ["sum", "max"]
+    log1p: true
+    percentile_group: [["product_type", "year"], ["product_type"], ["product_family"]]
+  loan_balance:
+    aggregations: ["sum", "max"]
+    log1p: true
+    percentile_group: [["product_type", "year"], ["product_type"], ["product_family"]]
+  credit_exposure:
+    aggregations: ["sum"]
+    log1p: true
+    percentile_group: null
+
+percentiles:
+  enable: true
+  # A grouping level is only used if its cell held at least this many
+  # rows at fit time; otherwise the next fallback level is tried.
+  min_cell_size: 30
+
+# ---------------------------------------------------------------------
+# Sequence block: the last `window` acquisitions as of the anchor,
+# position 1 = anchor (most recent).
+# ---------------------------------------------------------------------
+sequence:
+  window: 4
+  # Raw values carried through at each position.
+  carry_columns: ["product_type", "product_family", "deposit_balance", "loan_balance"]
+  # Percentile-encoded versions carried at each position. Must appear
+  # in numeric_columns with a non-null percentile_group.
+  carry_percentiles: ["deposit_balance", "loan_balance"]
+  # Emit gap_i_j (months between consecutive acquisitions) plus
+  # mean / min / trend summaries.
+  emit_gaps: true
+
+aggregates:
+  # Counts of acquisitions per family over full history to anchor.
+  count_by_family: true
+  # Also break numeric aggregations out per family. Multiplies the
+  # aggregate block width by the number of families; off by default.
+  numerics_by_family: false
+  # Months from first-ever acquisition to anchor. Requires full history
+  # to be present in the input; drop if the serving payload cannot
+  # supply a first-acquisition date.
+  emit_tenure: true
+
+# ---------------------------------------------------------------------
+# Eligibility and labelling
+# ---------------------------------------------------------------------
+labeling:
+  extract_date: "2026-06-30"
+  # Fixed-horizon dataset only. Converters with a longer gap are
+  # EXCLUDED, never relabelled 0.
+  horizon_months: 36
+  # Customers need at least this many non-outcome rows to be eligible.
+  min_acquisitions: 1
+
+hazard:
+  bin_months: 6
+  max_followup_months: 60
+  # Drop the final partial interval when its exposure fraction is below
+  # this. Set to 0.0 to keep every partial interval.
+  min_exposure_frac: 0.5

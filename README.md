@@ -60,6 +60,43 @@ outputs/reports/                    eda_report.html, model_report.html,
                                     next_best_customers.csv, segment_profiles.csv
 ```
 
+### Viewing results
+
+The two reports are the intended way in: open
+`outputs/reports/eda_report.html` and `outputs/reports/model_report.html`
+directly in a browser — they are single self-contained files, so no server and
+no network. Everything else a run writes is a plain CSV you can open anywhere:
+
+- `outputs/reports/next_best_customers.csv` — the campaign list, one row per
+  targeted customer: `rank`, the customer id, `score` (out-of-fold, averaged
+  across repeats) with `score_min`/`score_max`, `decile`, `segment`,
+  `reason_codes`, and `actual` (the known label, for sanity-checking only).
+- `outputs/model_output/` — `metrics.csv` (read PR-AUC and lift, not ROC-AUC),
+  `metrics_by_repeat.csv`, `calibration.csv`, `features.csv` (check
+  `sign_consistency` before quoting a coefficient), and `predictions.csv`
+  (the out-of-fold scores the ranking is built from).
+- `outputs/model_data/exclusions.csv` — every dropped customer with the reason,
+  per design.
+
+`outputs/model_output/model.joblib` is not a bare estimator but a dict bundle:
+
+```python
+import joblib
+bundle = joblib.load("outputs/model_output/model.joblib")
+print(bundle["note"])          # what it was fit on and what it is for
+pipe = bundle["pipeline"]      # full sklearn pipeline: impute -> encode -> scale -> fit
+cols = bundle["numeric"] + bundle["categorical"]
+scores = pipe.predict_proba(new_rows[cols])[:, 1]
+```
+
+Alongside the pipeline it records the feature lists, `design`, `label_column`,
+the entire `model_config`, row/customer/event counts, the sklearn version, a
+timestamp, and `downsampled_training_frame` — whether it was fit on the sampled
+frame (probabilities shifted above the true base rate) or the full population.
+Use it only to score customers who were **not** in the training extract; the
+ranking of the current population lives in `predictions.csv` (see "Two scores,
+kept apart" below).
+
 ### The path rule
 
 A relative path inside a config file resolves against **the directory holding

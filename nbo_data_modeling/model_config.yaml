@@ -5,10 +5,12 @@
 # and hazard; nothing else needs to change.
 # =====================================================================
 
+# Relative paths resolve against the directory holding THIS FILE, which is
+# also what you get running `cd nbo_data_modeling && python model.py`.
 io:
   # Point at one of the files in model_data/.
-  input_path:  "/mnt/user-data/outputs/model_data/hazard_dataset.csv"
-  output_dir:  "/mnt/user-data/outputs/model_output"
+  input_path:  "../outputs/model_data/hazard_dataset.csv"
+  output_dir:  "../outputs/model_output"
 
 # flat   = one row per customer, label column, direct evaluation.
 # hazard = one row per customer-interval; per-interval hazards are

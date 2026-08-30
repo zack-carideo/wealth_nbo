@@ -1,0 +1,222 @@
+# =====================================================================
+# EDA / reporting config  —  the only input to eda.py and main.py.
+#
+# Everything the reporting layer needs lives here. Neither eda.py,
+# main.py nor anything under nbo_report/ contains a column name, a
+# threshold or a path. Point the whole thing at a different dataset by
+# editing this file plus the two stage configs it references.
+#
+# The two stage configs stay authoritative for their own stage:
+#   nbo_data_preprocessing/config.yaml   feature construction
+#   nbo_data_modeling/model_config.yaml  fitting and evaluation
+# This file never overrides them, it only reads them so the reports can
+# describe what actually ran.
+#
+# PATH RULE: every relative path in a config resolves against the
+# directory holding THAT config file. So "../outputs/x" in
+# nbo_data_preprocessing/config.yaml and "outputs/x" here are the same
+# place, and `cd nbo_data_preprocessing && python preprocess.py` still
+# works standalone.
+# =====================================================================
+
+io:
+  # The two stage configs. Read for their column roles and thresholds,
+  # and passed to the stage scripts when the steps below are enabled.
+  preprocess_config: "nbo_data_preprocessing/config.yaml"
+  model_config:      "nbo_data_modeling/model_config.yaml"
+
+  # make_synthetic.py lives beside the modeling code even though its
+  # output feeds preprocessing.
+  synthetic_script:  "nbo_data_modeling/make_synthetic.py"
+  preprocess_script: "nbo_data_preprocessing/preprocess.py"
+  model_script:      "nbo_data_modeling/model.py"
+
+  report_dir:        "outputs/reports"
+  eda_report:        "eda_report.html"
+  model_report:      "model_report.html"
+  target_list:       "next_best_customers.csv"
+  segment_profile:   "segment_profiles.csv"
+
+  # The refit-on-everything deliverable. Ranking is done on out-of-fold
+  # scores; this artifact is what a scoring job would load.
+  model_artifact:    "outputs/model_output/model.joblib"
+
+# ---------------------------------------------------------------------
+# Which stages to run before reporting. Turn them all off to re-render
+# the reports from artifacts already on disk, which is the fast loop
+# while iterating on the HTML.
+# ---------------------------------------------------------------------
+steps:
+  generate_synthetic: true
+  run_preprocess:     true
+  run_model:          true          # ignored by eda.py, which never models
+
+# Only used when steps.generate_synthetic is true. The raw file is
+# written to io.input_path of the preprocessing config, so the two
+# always agree about where it is.
+synthetic:
+  customers:  25000
+  seed:       7
+  base_rate:  0.02
+
+# =====================================================================
+# STRUCTURAL SCHEMA
+#
+# The column names preprocess.py writes into its own output files. They
+# are the contract between the stages, and they are declared here rather
+# than hardcoded in the reporting code so that a fork of preprocess.py
+# that names things differently needs a config edit and no code change.
+#
+# Everything the reports read is named either here or in the `columns:`
+# block of nbo_data_preprocessing/config.yaml. There are no column names
+# in eda.py, main.py or nbo_report/.
+# =====================================================================
+schema:
+  # Written by preprocess.py into flat_dataset.csv / hazard_dataset.csv.
+  customer:     "customer"
+  anchor_date:  "anchor_date"
+  flat_label:   "label"          # flat design writes this
+  hazard_label: "event"          # hazard design writes this
+
+  # Derived by preprocess.load_data from product_families.map. Used for
+  # the raw-volume overview; if it is absent that chart is skipped.
+  family:       "product_family"
+
+  # Hazard bookkeeping: real columns, but never features and never
+  # profiled as such.
+  hazard_bookkeeping: ["interval", "months_low", "months_high",
+                       "exposure_frac"]
+
+  # Columns of exclusions.csv.
+  exclusions:
+    design:   "design"
+    customer: "customer"
+    reason:   "reason"
+
+  # Columns of the frame preprocess.compute_anchors returns. This is a
+  # function's return value rather than a file, so it only changes if
+  # preprocess.py itself is reworked.
+  anchors:
+    customer:    "customer"
+    anchor_date: "anchor_date"
+    keep:        "keep"
+    event:       "event"
+
+# =====================================================================
+# WORDING
+#
+# The pipeline is generic; only the vocabulary is about cross-sell.
+# Point it at a different problem and change these, not the code.
+# =====================================================================
+labels:
+  eda_title:    "Cross-sell EDA"
+  eda_subtitle: >-
+    Who is in the book, what they bought in what order, and which of
+    those paths lead to a wealth product.
+  model_title:    "Cross-sell model report"
+  model_subtitle: >-
+    How well the model ranks, what it is keying on, and the customers
+    to call next.
+
+  # Nouns used in generated prose. "converted"/"converter" become
+  # "churned"/"churner" for an attrition model, and so on.
+  event_name:     "conversion"
+  event_verb:     "convert"
+  actor_name:     "converter"
+  non_actor_name: "non-converter"
+
+# ---------------------------------------------------------------------
+# Sequence / Markov profiling.
+#
+# Deliberately generic: `event_column` names any column on the raw
+# acquisition rows, and the alphabet is whatever values it takes. It is
+# not specific to cross-sell — point it at a servicing-event column and
+# the same code profiles the paths into that event instead.
+# ---------------------------------------------------------------------
+sequences:
+  event_column: "product_family"     # e.g. product_type for a finer alphabet
+
+  # Anchors used to cut each customer's history. "hazard" anchors at the
+  # last acquisition and drops nobody for timing, which is what you want
+  # for description. "fixed" mirrors the flat modelling population.
+  anchor_mode: "hazard"
+
+  # Markov orders to profile. Order k looks at the k events immediately
+  # preceding the anchor.
+  orders: [1, 2, 3]
+
+  # A sequence needs this many customers before it is ranked. Below it,
+  # lift is noise.
+  min_support: 25
+  top_n: 12
+
+  # Transition matrices are cut to the most frequent states, otherwise
+  # the heatmap is unreadable.
+  transition_order: 1
+  transition_top_states: 8
+
+# ---------------------------------------------------------------------
+# Engineered-feature profiling.
+# ---------------------------------------------------------------------
+profiling:
+  # Which preprocess output to profile: "flat" gives one row per
+  # customer, so distributions and IV read as customer counts. Profiling
+  # "hazard" instead counts a customer once per interval at risk.
+  dataset: "flat"
+
+  decile_bins: 10
+  iv_bins: 10
+  # Bins holding fewer rows than this are pooled before WoE, so a
+  # near-empty cell cannot dominate IV.
+  min_bin_count: 25
+  # How many features get a chart (the tables cover all of them).
+  max_features_charted: 8
+  top_iv_features: 20
+
+  # Raw-data overview charts.
+  balance_columns_charted: 3
+  max_categories_charted: 12
+
+# ---------------------------------------------------------------------
+# Scoring, segmentation and the campaign list.
+# ---------------------------------------------------------------------
+targeting:
+  # Rows written to next_best_customers.csv.
+  top_n: 500
+
+  # Cross-validation runs on the downsampled frame (that is the point of
+  # sampling). The PERSISTED model is a different job: it scores new
+  # customers, so it wants the real population, or its probabilities sit
+  # above the true base rate. true refits it on every eligible customer,
+  # which costs one extra fit. Set false to refit on the sampled frame
+  # instead; the report says which was used either way.
+  refit_on_full_population: true
+  score_deciles: 10
+  reason_codes: 3
+
+  # "High propensity" = this top fraction of the scored population. Both
+  # the segment model and the sequence profile in model_report.html are
+  # fit on that subset.
+  high_propensity_fraction: 0.10
+
+  segments:
+    k: 4
+    # Features named in a segment's auto-generated profile.
+    max_profile_features: 6
+    # A feature must sit this many standard deviations away from the
+    # population mean to be called out as distinguishing.
+    min_zscore: 0.35
+    random_state: 42
+
+# ---------------------------------------------------------------------
+# Thresholds the reports flag against. These are reporting conventions,
+# not modelling decisions — they only control what gets a warning badge.
+# ---------------------------------------------------------------------
+report:
+  max_table_rows: 40
+  # features.csv sign consistency below this is reported as unproven.
+  sign_consistency_floor: 0.7
+  # ROC-AUC is annotated as unreliable below this prevalence.
+  low_prevalence_threshold: 0.01
+  # Lift below this in the top decile is called out as weak separation.
+  weak_lift_threshold: 1.5

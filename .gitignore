@@ -5,9 +5,17 @@
 # ---------------------------------------------------------------------
 
 # default output directories from the `io:` blocks in the configs
+outputs/
 model_data/
 model_output/
 artifacts/
+
+# eda.py / main.py deliverables (HTML reports, campaign list, pickled model)
+reports/
+eda_report.html
+model_report.html
+next_best_customers.csv
+model.joblib
 
 # preprocess.py
 flat_dataset.csv

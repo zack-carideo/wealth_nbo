@@ -6,10 +6,12 @@
 # dataset with different features, edit this file only.
 # =====================================================================
 
+# Relative paths resolve against the directory holding THIS FILE, which is
+# also what you get running `cd nbo_data_preprocessing && python preprocess.py`.
 io:
-  input_path:   "/mnt/user-data/outputs/sample_raw_acquisitions.csv"
-  output_dir:   "/mnt/user-data/outputs/model_data"
-  artifact_dir: "/mnt/user-data/outputs/artifacts"
+  input_path:   "../outputs/synthetic.csv"
+  output_dir:   "../outputs/model_data"
+  artifact_dir: "../outputs/artifacts"
 
 # ---------------------------------------------------------------------
 # Which column plays which role. These are the only names the script

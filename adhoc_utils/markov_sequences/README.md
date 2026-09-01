@@ -25,9 +25,10 @@ adhoc_utils/markov_sequences/
 3. [Options reference](#options-reference)
 4. [Running end to end](#running-end-to-end)
 5. [What comes out](#what-comes-out)
-6. [Python API](#python-api)
-7. [Things that are easy to get wrong](#things-that-are-easy-to-get-wrong)
-8. [Sample input walkthrough](#sample-input-walkthrough) (the original `SAMPLE_FORMAT.md`)
+6. [Mapping transitions and paths back to ids](#mapping-transitions-and-paths-back-to-ids)
+7. [Python API](#python-api)
+8. [Things that are easy to get wrong](#things-that-are-easy-to-get-wrong)
+9. [Sample input walkthrough](#sample-input-walkthrough) (the original `SAMPLE_FORMAT.md`)
 
 ---
 
@@ -278,9 +279,17 @@ Three things to do first:
 | `transitions` | (from, to) pair | `from_state`, `to_state`, `n`, `from_n`, `prob`, `prob_smoothed`, `thin`, `lift`, and `gap_days_median` / `gap_days_mean` when a time column was given |
 | `from_states` | origin state | `from_state`, `n`, `n_distinct_next`, `entropy_bits`, `entropy_norm` (0 = one certain next state, 1 = uniform over the alphabet), `top_next`, `top_next_prob`, `thin` |
 | `paths` | contiguous run | `path` (states joined with `>`), `n`, `share` |
+| `pairs` | observed transition | `<id_col>`, `from_state`, `to_state`, and `gap_days` when a time column was given. **In-memory only** — see below. |
+| `path_rows` | observed run | `<id_col>`, `path`. **In-memory only.** |
 
 `params` records every fit argument plus `n_to_states`, `to_states`, `n_ids`,
 `n_rows`, `n_transitions`, so a loaded model is self-describing.
+
+`pairs` and `path_rows` are the row-level frames the aggregates were counted
+from, with the id still attached. They exist only on the object returned by
+`fit()`; `save()` does not write them and a model from `load()` has them set
+to `None`. That keeps the JSON proportional to the number of states, not the
+number of rows.
 
 `lift` is `prob / (destination's unconditional share of all transitions)`.
 Above 1 means this origin makes that destination more likely than chance.
@@ -302,6 +311,59 @@ which matters when events are scarce.
 
 ---
 
+## Mapping transitions and paths back to ids
+
+The summary tells you *that* `cd_standard -> heloc` happened; these tell you
+*who*. Both return a small frame of `<id_col>, n` sorted by `n` descending —
+`n` is how many times that id made the move, since one customer can repeat a
+transition (C002 does `savings_standard -> savings_standard` twice).
+
+```python
+model = sp.fit(df, "customer_id", "product_type", path_length=2)
+
+model.ids_for_transition("cd_standard", "heloc")
+#   customer_id  n
+# 0        C005  1
+
+model.ids_for_transition("savings_standard", "savings_standard")
+#   customer_id  n
+# 0        C002  2
+
+model.ids_for_path("checking_basic>savings_standard")
+#   customer_id  n
+# 0        C001  1
+# 1        C006  1
+```
+
+Rules:
+
+- **`ids_for_path` needs a run of the same length as `path_length` at fit
+  time.** A model fit with `path_length=3` cannot answer a two-state path;
+  refit, or use `ids_for_transition` for the pairwise case.
+- **Order 2 origins are joined with `>`.** For a model fit with `order=2`,
+  `ids_for_transition("checking_basic>savings_standard", "auto_loan")`.
+- **Sentinels work like any other state** when fit with `add_boundaries=True`:
+  `ids_for_transition("<START>", "checking_basic")` is "who opened with a
+  basic checking account".
+- **A pair or path never seen returns an empty frame**, not an error.
+- **Loaded models raise.** The lookups need `model.pairs` / `model.path_rows`,
+  which are not persisted (see [What comes out](#what-comes-out)). Calling
+  either on a `SequenceModel.load()` result raises a `ValueError` saying so.
+  If you need the mapping, refit on the frame; it is cheap.
+
+For anything the two helpers don't cover, filter the frames directly:
+
+```python
+# every transition C006 made, with the gap in days
+model.pairs[model.pairs["customer_id"] == "C006"]
+
+# ids whose chain ever passes through MISSING, from either side
+p = model.pairs
+p.loc[(p.from_state == "MISSING") | (p.to_state == "MISSING"), "customer_id"].unique()
+```
+
+---
+
 ## Python API
 
 ```python
@@ -316,8 +378,12 @@ model.prob("checking_basic", "heloc")   # smoothed P(to | from); never 0
 model.transitions                       # the long table
 model.from_states, model.states, model.paths, model.lengths, model.params
 
+model.ids_for_transition("checking_basic", "heloc")   # who made this move
+model.ids_for_path("a>b>c")                           # who walked this run
+model.pairs, model.path_rows                          # the id-level frames
+
 model.save("markov.json")
-model = sp.SequenceModel.load("markov.json")
+model = sp.SequenceModel.load("markov.json")   # pairs / path_rows are None here
 scores = sp.score(df, model)
 ```
 
@@ -395,13 +461,18 @@ Nothing here is validated. The frame is taken at its word.
 ### Filter outcome rows before fitting
 
 C005's target row has no `product_type`, so it enters the chain as `MISSING`
-and invents two transitions that describe your labelling convention rather than
+and invents a transition that describes your labelling convention rather than
 customer behaviour:
 
 ```
 heloc    -> MISSING     n=1
-MISSING  -> auto_loan   n=1      (this one crosses from C004 into C005)
 ```
+
+(An earlier version of this note also blamed `MISSING -> auto_loan` on the
+outcome row. `model.ids_for_transition("MISSING", "auto_loan")` shows it
+belongs to C004 — a real null state followed by a real product — and the
+id-contiguity check already stops C005's trailing `MISSING` from pairing with
+C006's first row. That is what the lookup is for.)
 
 So:
 

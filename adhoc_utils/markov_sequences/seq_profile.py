@@ -32,6 +32,11 @@ WHAT COMES OUT
     transitions   from -> to, with counts, probabilities and gap stats
     from_states   per-origin summary: n, entropy, most likely next
     paths         most common contiguous runs of `path_length` states
+    pairs         one row per transition WITH the id (in-memory only)
+    path_rows     one row per run WITH the id (in-memory only)
+
+    model.ids_for_transition("cd_standard", "heloc")   -> who did it
+    model.ids_for_path("checking_basic>savings_standard>auto_loan")
 
 --------------------------------------------------------------------
 THINGS THAT ARE EASY TO GET WRONG HERE
@@ -70,13 +75,54 @@ class SequenceModel:
     you are scoring.
     """
 
-    def __init__(self, transitions, states, lengths, from_states, paths, params):
+    def __init__(self, transitions, states, lengths, from_states, paths, params,
+                 pairs=None, path_rows=None):
         self.transitions = transitions      # from_state, to_state, n, prob, ...
         self.states = states                # state, n, n_ids, share
         self.lengths = lengths              # per-id sequence lengths
         self.from_states = from_states      # per-origin summary
         self.paths = paths                  # common runs
         self.params = params                # order, alpha, min_count, ...
+        # Row-level frames, kept only on the object returned by fit().
+        # They are NOT written by save(), so a loaded model has None here.
+        self.pairs = pairs                  # id, from_state, to_state[, gap_days]
+        self.path_rows = path_rows          # id, path
+
+    # -- who did what ------------------------------------------------
+
+    def ids_for_transition(self, from_state, to_state):
+        """
+        Ids that made this transition, with how many times each did.
+        Only available on a model straight from fit(); a loaded model
+        raises because the row-level frame is not persisted.
+        """
+        self._need_rows(self.pairs, "pairs")
+        id_col = self.params["id_col"]
+        hit = self.pairs[(self.pairs["from_state"] == str(from_state))
+                         & (self.pairs["to_state"] == str(to_state))]
+        return (hit.groupby(id_col).size().rename("n").reset_index()
+                   .sort_values(["n", id_col], ascending=[False, True])
+                   .reset_index(drop=True))
+
+    def ids_for_path(self, path):
+        """
+        Ids whose sequence contains this contiguous run, e.g.
+        "checking_basic>savings_standard>auto_loan". Length must match
+        the `path_length` the model was fit with.
+        """
+        self._need_rows(self.path_rows, "path_rows")
+        id_col = self.params["id_col"]
+        hit = self.path_rows[self.path_rows["path"] == str(path)]
+        return (hit.groupby(id_col).size().rename("n").reset_index()
+                   .sort_values(["n", id_col], ascending=[False, True])
+                   .reset_index(drop=True))
+
+    @staticmethod
+    def _need_rows(frame, name):
+        if frame is None:
+            raise ValueError("model.%s is not available: row-level frames are "
+                             "kept only on the object returned by fit(), not "
+                             "on one reloaded with load()" % name)
 
     # -- lookup ------------------------------------------------------
 
@@ -266,7 +312,7 @@ def fit(df, id_col, state_col, time_col=None, order=1, alpha=0.5,
     from_states = _origin_summary(trans, n_to, min_count)
 
     # ---- common runs ------------------------------------------------
-    paths = _paths(prep, id_col, state_col, path_length, top_paths)
+    paths, path_rows = _paths(prep, id_col, state_col, path_length, top_paths)
 
     params = {"id_col": id_col, "state_col": state_col, "time_col": time_col,
               "order": order, "alpha": alpha, "min_count": min_count,
@@ -275,7 +321,8 @@ def fit(df, id_col, state_col, time_col=None, order=1, alpha=0.5,
               "n_ids": int(prep[id_col].nunique()),
               "n_rows": int(len(prep)), "n_transitions": int(len(pairs))}
 
-    return SequenceModel(trans, states, lengths, from_states, paths, params)
+    return SequenceModel(trans, states, lengths, from_states, paths, params,
+                         pairs=pairs, path_rows=path_rows)
 
 
 def _origin_summary(trans, n_to, min_count):
@@ -301,9 +348,16 @@ def _origin_summary(trans, n_to, min_count):
 
 
 def _paths(prep, id_col, state_col, path_length, top_n):
-    """Most common contiguous runs of `path_length` states."""
+    """
+    Most common contiguous runs of `path_length` states.
+
+    Returns two frames: the aggregate (path, n, share) that goes into the
+    summary, and the row-level (id, path) frame it was counted from, so a
+    path can be traced back to the ids that walked it.
+    """
     if path_length < 2:
-        return pd.DataFrame(columns=["path", "n", "share"])
+        return (pd.DataFrame(columns=["path", "n", "share"]),
+                pd.DataFrame(columns=[id_col, "path"]))
     ids, states = prep[id_col], prep[state_col]
 
     joined = states.shift(path_length - 1)
@@ -311,10 +365,12 @@ def _paths(prep, id_col, state_col, path_length, top_n):
         joined = joined.str.cat(states.shift(k), sep=">")
     valid = (ids.shift(path_length - 1) == ids) & joined.notna()
 
-    counts = joined[valid].value_counts()
+    path_rows = pd.DataFrame({id_col: ids[valid], "path": joined[valid]}
+                             ).reset_index(drop=True)
+    counts = path_rows["path"].value_counts()
     out = counts.head(top_n).rename_axis("path").reset_index(name="n")
     out["share"] = out["n"] / counts.sum()
-    return out
+    return out, path_rows
 
 
 # =====================================================================

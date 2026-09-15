@@ -1,0 +1,104 @@
+# ------------------------------------------------------------------
+# Lookalike prospecting pipeline — everything the code needs is here.
+# One row per customer. Target = 1 for customers who already hold /
+# bought the product, 0 otherwise. Run:  python lookalike.py config.yaml
+# ------------------------------------------------------------------
+
+data:
+  path: data/customers.csv          # csv or parquet
+  id_col: customer_id
+  target_col: bought_product
+  # Optional: rows with 0 in this column are never scored as prospects
+  # (still used as population background). null = score everyone.
+  eligible_col: null
+  # Optional: sales rep / branch / book column, passed through to the
+  # lead list and used as the filter dropdown on the map. null = none.
+  rep_col: rep_id
+  # Columns to ignore entirely (leakage, keys, free text, etc.)
+  drop_cols: [open_date, email]
+  # Force a type when inference gets it wrong. Values: numeric | categorical
+  type_overrides: {}
+  # Optional: cap rows read for a quick dry run. null = all rows.
+  max_rows: null
+
+preprocess:
+  # Column with <= this many distinct values is categorical even if numeric-typed
+  categorical_max_unique: 12
+  # Categorical levels with fewer rows than this collapse into "__other__"
+  min_level_count: 50
+  # Categoricals with more distinct levels than this are replaced by a
+  # shrunken buyer-rate encoding (numeric) instead of one level at a time
+  high_cardinality_threshold: 40
+  high_cardinality_shrinkage: 20      # prior weight (in rows) pulling rare levels to the base rate
+  # Numerics are rank-transformed to [0,1] so whales don't dominate distance
+  rank_transform_numeric: true
+  # Add an is-missing indicator for columns with missing rate above this
+  missing_indicator_min_rate: 0.02
+
+profile:
+  # How many random pseudo-buyer sets to draw for the null distribution
+  n_permutations: 300
+  # A feature is "indicative" only if its real separation beats this
+  # quantile of its own permutation null
+  null_quantile: 0.99
+  # Hard cap / floor on features carried into the similarity metric
+  max_features: 15
+  min_features: 3
+  # Numeric separation statistic: ks (catches shape differences, e.g. two buyer
+  # age groups) or auc (pure shift; slightly more power for one-sided effects)
+  numeric_stat: ks
+  # Prior count for shrinking per-level categorical log-odds toward base rate
+  categorical_shrinkage: 5
+  # Optional: features that may NOT be used no matter how strong (e.g. scale proxies)
+  exclude_features: []
+
+archetypes:
+  enabled: true
+  min_buyers: 30           # below this, buyers are treated as one group
+  max_k: 4
+  min_silhouette: 0.30     # only split if clusters are this well separated
+
+similarity:
+  engines: [gower, rf_density]      # any subset; results are rank-blended
+  blend_weights: {gower: 0.5, rf_density: 0.5}
+  k_neighbors: 5                    # mean distance to k nearest buyers
+  rf_density:
+    n_trees: 300
+    min_leaf: 50
+    max_features: 0.5
+  chunk_rows: 50000                 # memory control for N x B distance blocks
+  random_state: 42
+
+validation:
+  leave_one_out: true
+  population_sample: 30000          # rows scored per held-out buyer
+  n_bootstrap: 500
+  bands: [0.005, 0.01, 0.02, 0.05, 0.10]   # top-x% bands reported to sales
+
+output:
+  dir: outputs
+  top_n_leads: 2000
+  n_reasons: 3              # "why similar" bullets per lead (in leads.csv and the map panel); max = number of indicative features
+  # Score bands shown to reps, in ascending order of strictness label
+  band_labels:
+    0.01: "A - top 1%"
+    0.02: "B - top 2%"
+    0.05: "C - top 5%"
+    0.10: "D - top 10%"
+
+map:
+  enabled: true
+  method: tsne              # tsne | umap (umap if installed) | pca
+  # --- how busy the map is
+  n_prospects: 300          # only the top-N leads are plotted (the CSV still has top_n_leads)
+  show_background: true     # light grey sample of ordinary customers for context
+  n_background: 600         # size of that sample (ignored if show_background is false)
+  height: 680               # plot height in px
+  # --- what the side panel shows when a rep clicks a prospect
+  k_links: 5                # nearest buyers listed and drawn as links
+  # Extra raw columns to show in the profile table, in addition to the
+  # indicative features the score uses (shown greyed, e.g. for context reps care about)
+  extra_fields: [n_products, logins_90d, age]
+  perplexity: 30
+  random_state: 42
+  embed_plotlyjs: true      # true = works offline (adds ~4MB); false = loads plotly.js from CDN

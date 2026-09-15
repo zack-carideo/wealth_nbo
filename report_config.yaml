@@ -178,6 +178,46 @@ profiling:
   max_categories_charted: 12
 
 # ---------------------------------------------------------------------
+# Association-rule (market-basket) mining against the target item.
+# ---------------------------------------------------------------------
+associations:
+  target: "y"
+  exclude: ["id", "stratum"]
+
+  # Numeric columns are cut into this many bins; categoricals with more
+  # than max_levels distinct values are dropped rather than exploded.
+  n_bins: 4
+  max_levels: 12
+  # Items present in more than this fraction of rows are too common to
+  # carry signal.
+  max_item_cov: 0.5
+
+  # An itemset needs this many target events before it is scored.
+  min_events: 10
+  # Maximum number of items on the left-hand side of a rule.
+  max_len: 3
+  min_lift: 1.5
+  min_conf_ev: 5
+
+  seed: 7
+  top_n: 10
+  # Share of each target class that goes into the discover half; the
+  # rest is the holdout every rule has to replicate on. Stratified, so
+  # both halves carry the same event rate.
+  discover_frac: 0.6
+  # Two-sided alpha for the Poisson interval on an event count, so 0.05
+  # makes lift_lo / lift_hi a 95% interval.
+  ci_alpha: 0.05
+  # Benjamini-Hochberg false-discovery rate for rule significance.
+  fdr: 0.10
+  # Rules sharing more than this fraction of their support are pruned
+  # as near-duplicates.
+  max_overlap: 0.5
+
+  # Id of the target item inside the item matrix.
+  tid: "__target__"
+
+# ---------------------------------------------------------------------
 # Scoring, segmentation and the campaign list.
 # ---------------------------------------------------------------------
 targeting:

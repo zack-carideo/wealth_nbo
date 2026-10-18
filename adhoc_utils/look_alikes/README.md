@@ -22,6 +22,8 @@ of the product. Optional: a rep/book column (filter for reps), an eligibility fl
 |---|---|
 | `leads.csv` | ranked prospects: score percentile, band (A = top 1% …), archetype, nearest existing buyer, plain-language reasons, historical lift of that band |
 | `buyer_profile.csv` | the features that separate buyers from everyone else, with buyer-typical vs population-typical values — the "buyer signature" |
+| `buyer_types.png` | one-page static card: rows = traits, columns = All buyers / Type 1 / Type 2 …; numerics on a "where among all customers" scale, categoricals as share-of-type vs share-of-everyone. Printable, no browser needed |
+| `buyer_types.md` / `.csv` | auto-written plain-language description of each buyer type ("Type 2: branch channel, tenure well above typical…") and the numbers behind the figure |
 | `validation_lift.csv` | leave-one-buyer-out lift by band with bootstrap CIs — the number to quote to sales ("customers in band A bought at ~45x the average rate") |
 | `prospect_map.html` | interactive map for reps: stars = buyers, dots = prospects; click a dot for reasons + its most similar buyers; filter by rep; search an id. Self-contained, opens in any browser |
 | `run_summary.json` | feature weights, counts, engines used |
@@ -67,6 +69,8 @@ of the product. Optional: a rep/book column (filter for reps), an eligibility fl
 * `map.extra_fields` — extra raw columns shown (greyed) in the click-panel profile table alongside the
   indicative features, e.g. fields reps care about that the score doesn't use.
 * `output.n_reasons` — how many "why similar" bullets per lead, in both `leads.csv` and the map panel.
+* `profiles.enabled` / `profiles.max_levels` / `profiles.extra_fields` — the static buyer-type card; extra fields
+  default to the map's.
 * `map.method` — `tsne` (default, sklearn), `umap` if installed, `pca` for speed.
 
 ## The click panel
@@ -84,5 +88,5 @@ and the forest. Scales linearly in rows; the Gower distance is computed N × buy
 
 ## Files
 
-`lookalike.py` — pipeline. `prospect_map.py` — the HTML map. `make_synthetic.py` — planted-signal test data.
+`lookalike.py` — pipeline. `prospect_map.py` — the HTML map. `buyer_profiles.py` — the static buyer-type card. `make_synthetic.py` — planted-signal test data.
 `config.yaml` — every parameter.

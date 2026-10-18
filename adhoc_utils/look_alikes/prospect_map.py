@@ -119,13 +119,13 @@ def build_map(cfg, df, feat_mat, buyers, arche, lead_rows, leads, prospects, out
         hovertemplate="<b>%{customdata[0]}</b><br>Rep: %{customdata[1]}<br>%{customdata[2]}<br>"
                       "Score pct: %{customdata[3]:.1f}<extra></extra>"))
     n_types = int(arche.max()) + 1
-    palette = ["#1f4e79", "#2e8b57", "#8b2e8b", "#b8860b"]
+    palette = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#4a3aa7"]
     for t in range(n_types):
         sel = arche == t
         fig.add_trace(go.Scattergl(
             x=zb[sel, 0], y=zb[sel, 1], mode="markers",
             name="Existing buyers" if n_types == 1 else f"Buyers — type {t + 1}",
-            marker=dict(size=13, symbol="star", color=palette[t % 4], line=dict(width=1, color="white")),
+            marker=dict(size=13, symbol="star", color=palette[t % len(palette)], line=dict(width=1, color="white")),
             customdata=[[ids[b], f"type {t + 1}"] for b in buyers[sel]],
             hovertemplate="<b>Buyer %{customdata[0]}</b><br>%{customdata[1]}<extra></extra>"))
     fig.update_layout(template="plotly_white", height=m.get("height", 680), autosize=True,

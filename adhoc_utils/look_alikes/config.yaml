@@ -86,6 +86,11 @@ output:
     0.05: "C - top 5%"
     0.10: "D - top 10%"
 
+profiles:
+  enabled: true             # static buyer-type card: buyer_types.png + .csv + .md
+  max_levels: 4             # categorical levels shown per trait
+  extra_fields: null        # null = reuse map.extra_fields; or give a list of raw columns
+
 map:
   enabled: true
   method: tsne              # tsne | umap (umap if installed) | pca

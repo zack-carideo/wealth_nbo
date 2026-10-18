@@ -515,11 +515,20 @@ def run(cfg: dict) -> dict:
                    loo_median_percentile=float(np.median(loo_pct)) if loo_pct is not None else None)
     (out_dir / "run_summary.json").write_text(json.dumps(summary, indent=2, default=float))
 
-    # --- 7. map for reps
+    # --- 7. static buyer-type profiles (png + csv + md)
+    # raw source columns behind the indicative features, in weight order (deduped)
+    profile_fields = list(dict.fromkeys(pre.feature_info[f]["source"] for f in weights.index))
+    if cfg.get("profiles", {}).get("enabled", True):
+        from buyer_profiles import build_profiles
+        extra = [c for c in (cfg.get("profiles", {}).get("extra_fields") or cfg.get("map", {}).get("extra_fields") or [])
+                 if c in df.columns and c not in profile_fields]
+        build_profiles(df, buyers, arche, profile_fields + extra, pre.types, out_dir,
+                       cfg.get("profiles", {}).get("max_levels", 4))
+        log("buyer type profiles written (buyer_types.png / .csv / .md)")
+
+    # --- 8. map for reps
     if cfg.get("map", {}).get("enabled"):
         from prospect_map import build_map
-        # raw source columns behind the indicative features, in weight order (deduped)
-        profile_fields = list(dict.fromkeys(pre.feature_info[f]["source"] for f in weights.index))
         build_map(cfg, df, feat_mat, buyers, arche, lead_rows, leads, prospects, out_dir / "prospect_map.html", rng,
                   profile_fields, pre.types)
         log(f"map written to {out_dir / 'prospect_map.html'}")
